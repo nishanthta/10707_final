@@ -203,8 +203,8 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience):
                 final_output = mlp_model(output)
                 
                 # Calculate both losses
-                cont_loss = contrastive_criterion(output1, output2, 1 - labels)  # Assuming label=1 for dissimilar, 0 for similar
-                bce_loss = bce_criterion(final_output, labels)
+                cont_loss = contrastive_loss(output1, output2, 1 - targets)  # Assuming label=1 for dissimilar, 0 for similar
+                bce_loss = bce_loss(final_output, targets)
                 
                 # Combine losses
                 loss = cont_loss + bce_loss
@@ -289,8 +289,8 @@ def main():
     criterion = nn.BCEWithLogitsLoss().to(device)
     
     # Path to the pretrained model checkpoint
-    checkpoint_path = '/notebooks/ADL/ViTPose_pytorch/chkpts/vitpose-b-multi-coco.pth'
-    # checkpoint_path = '/ViTPose_pytorch/chkpts/xyz.pth'
+    # checkpoint_path = '/notebooks/ADL/ViTPose_pytorch/chkpts/vitpose-b-multi-coco.pth'
+    checkpoint_path = '/ViTPose_pytorch/chkpts/xyz.pth' #fake path, to init train from scratch
     
     if os.path.exists(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location=device)
