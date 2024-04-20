@@ -2,6 +2,7 @@ from collections import defaultdict
 import os
 import random
 import torch
+import torch.nn.functional as F
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.cuda.amp import autocast, GradScaler
@@ -135,6 +136,21 @@ class ViTPose(nn.Module):
         x = self.backbone(x)
         x = self.keypoint_head(x)
         return x
+    
+class ContrastiveLoss(nn.Module):
+    def __init__(self, margin=1.0):
+        super(ContrastiveLoss, self).__init__()
+        self.margin = margin
+
+    def forward(self, output1, output2, label):
+        # Euclidean distance between output1 and output2
+        euclidean_distance = F.pairwise_distance(output1, output2, keepdim=True)
+        # Contrastive loss
+        loss = torch.mean((1-label) * torch.pow(euclidean_distance, 2) +
+                          (label) * torch.pow(torch.clamp(self.margin - euclidean_distance, min=0.0), 2))
+
+        return loss
+
 
 def train_model(model, mlp_model, train_loader, val_loader, device, patience):
     # criterion = JointsMSELoss().to(device)
@@ -191,8 +207,8 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience):
 
         if avg_val_loss < min_loss:
             epochs_without_improvement = 0
-            torch.save(model, '/home/nthumbav/Downloads/ViTPose_pytorch/vitpose_ckpt.pth')
-            torch.save(mlp_model, '/home/nthumbav/Downloads/ViTPose_pytorch/mlp_ckpt.pth')
+            torch.save(model, '/notebooks/ADL/ViTPose_pytorch/chkpts/vitpose_ckpt.pth')
+            torch.save(mlp_model, '/notebooks/ADL/ViTPose_pytorch/chkpts/mlp_ckpt.pth')
         
         else:
             epochs_without_improvement += 1
@@ -237,6 +253,35 @@ def main():
     mlp_model = MLPClassifier(input_dim=34*64*64, hidden_dim=512, output_dim=1).to(device) #update this
     criterion = nn.BCEWithLogitsLoss().to(device)
     
+    # Path to the pretrained model checkpoint
+    checkpoint_path = '/notebooks/ADL/ViTPose_pytorch/chkpts/vitpose-b-multi-coco.pth'
+    # checkpoint_path = '/ViTPose_pytorch/chkpts/xyz.pth'
+    
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        state_dict = checkpoint['state_dict']
+
+        # Adjust the first convolutional layer weights
+        # Average the RGB channels weights to fit grayscale input
+        first_conv_weight = state_dict['backbone.patch_embed.proj.weight']
+        first_conv_weight_mean = first_conv_weight.mean(dim=1, keepdim=True)
+        state_dict['backbone.patch_embed.proj.weight'] = first_conv_weight_mean
+
+        # Resize positional embeddings if necessary
+        pos_embed = state_dict['backbone.pos_embed']
+        current_pos_embed = model.backbone.pos_embed
+        if pos_embed.shape != current_pos_embed.shape:
+            # Interpolate positional embeddings
+            new_pos_embed = F.interpolate(pos_embed.permute(0, 2, 1), size=current_pos_embed.shape[-2], mode='linear', align_corners=True)
+            state_dict['backbone.pos_embed'] = new_pos_embed.permute(0, 2, 1)
+
+        # Load the adjusted state dict
+        model.load_state_dict(state_dict, strict=False)
+        print("Pretrained model loaded successfully with adjustments.")
+    else:
+        print("Checkpoint file not found. Training from scratch.")
+
+    
     # Load dataset
     # df = pd.read_csv('path_to_cedar_dataset.csv')  # Update path as necessary
     # dataset = DupletDataset(dataframe=df)
@@ -245,16 +290,16 @@ def main():
     # Initialize dataset
     # dataset = DupletDatasetCEDAR(base_dir='OSV_2D/CEDAR', transform=transform)
     dirs = defaultdict(list)
-    dirs['train'] = 'OSV_2D/CEDAR/train'
-    dirs['val'] = 'OSV_2D/CEDAR/val'
-    dirs['test'] = 'OSV_2D/CEDAR/test'
+    dirs['train'] = '/notebooks/ADL/ViTPose_pytorch/datasets/CEDAR/train'
+    dirs['val'] = '/notebooks/ADL/ViTPose_pytorch/datasets/CEDAR/val'
+    dirs['test'] = '/notebooks/ADL/ViTPose_pytorch/datasets/CEDAR/test'
+    
     train_signers = [name for name in os.listdir(dirs['train']) if os.path.isdir(os.path.join(dirs['train'], name))]
     val_signers = [name for name in os.listdir(dirs['val']) if os.path.isdir(os.path.join(dirs['val'], name))]
     test_signers = [name for name in os.listdir(dirs['test']) if os.path.isdir(os.path.join(dirs['test'], name))]
     
     #COMMENT OUT THE FOLLOWING TEST
     # train_signers, val_signers = train_signers[:5], val_signers[:2]
-
 
     train_dataset = DupletDatasetCEDAR(dirs['train'], transform=transform, signers=train_signers)
     val_dataset = DupletDatasetCEDAR(dirs['val'], transform=transform, signers=val_signers)
