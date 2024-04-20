@@ -151,14 +151,34 @@ class ContrastiveLoss(nn.Module):
 
         return loss
 
+    
+def adjust_learning_rate(optimizer, epoch, warmup_epochs, total_rampup_epochs, base_lr, max_lr):
+    if epoch < warmup_epochs:
+        # Linear warmup
+        lr = base_lr + (max_lr - base_lr) * (epoch / warmup_epochs)
+    elif epoch < total_rampup_epochs:
+        # Linear ramp-up
+        lr = max_lr
+    else:
+        # Steady state
+        lr = max_lr
+
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+    
 
 def train_model(model, mlp_model, train_loader, val_loader, device, patience):
+    base_lr = 0.0001  # Low initial learning rate during warmup
+    max_lr = 0.001    # Target learning rate after warmup
+    warmup_epochs = 5
+    total_rampup_epochs = 15 
     # criterion = JointsMSELoss().to(device)
     # criterion = nn.BCEWithLogitsLoss()
     contrastive_loss = ContrastiveLoss().to(device)
     bce_loss = torch.nn.BCEWithLogitsLoss().to(device)
     
-    optimizer = AdamW(model.parameters(), lr=0.001, betas=(0.9, 0.999), weight_decay=0.01)
+    # optimizer = AdamW(model.parameters(), lr=0.001, betas=(0.9, 0.999), weight_decay=0.01)
+    optimizer = torch.optim.Adam(list(model.parameters()) + list(mlp_model.parameters()), lr=base_lr)
     scheduler = StepLR(optimizer, step_size=10, gamma=0.1)
     scaler = GradScaler()
     epochs_without_improvement, min_loss = 0, 1e8
@@ -166,6 +186,7 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience):
     model.train()
     mlp_model.train()
     for epoch in range(200):  # Number of epochs
+        adjust_learning_rate(optimizer, epoch, warmup_epochs, total_rampup_epochs, base_lr, max_lr)
         total_loss, val_loss = 0, 0
         for images, targets in tqdm(train_loader):
 
@@ -258,8 +279,8 @@ def save_model(model, epoch, loss, descriptor="ViTPose"):
         
 #         return avg_val_loss
 
-    
-    
+
+
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
