@@ -154,7 +154,10 @@ class ContrastiveLoss(nn.Module):
 
 def train_model(model, mlp_model, train_loader, val_loader, device, patience):
     # criterion = JointsMSELoss().to(device)
-    criterion = nn.BCEWithLogitsLoss()
+    # criterion = nn.BCEWithLogitsLoss()
+    contrastive_loss = ContrastiveLoss().to(device)
+    bce_loss = torch.nn.BCEWithLogitsLoss().to(device)
+    
     optimizer = AdamW(model.parameters(), lr=0.001, betas=(0.9, 0.999), weight_decay=0.01)
     scheduler = StepLR(optimizer, step_size=10, gamma=0.1)
     scaler = GradScaler()
@@ -177,13 +180,24 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience):
                 output2 = model(images[1])
                 output = torch.reshape(torch.cat((output1, output2), dim=1), (batch_size, -1))
                 final_output = mlp_model(output)
-                loss = criterion(final_output, targets)
+                
+                # Calculate both losses
+                cont_loss = contrastive_criterion(output1, output2, 1 - labels)  # Assuming label=1 for dissimilar, 0 for similar
+                bce_loss = bce_criterion(final_output, labels)
+                
+                # Combine losses
+                loss = cont_loss + bce_loss
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
             total_loss += loss.item()
+            total_contrastive_loss += cont_loss.item()
+            
+        # After each epoch, print the average contrastive loss
+        avg_contrastive_loss = total_contrastive_loss / len(train_loader)
+        print(f'Epoch {epoch+1}, Avg Contrastive Loss: {avg_contrastive_loss}, Total Train Loss: {total_loss / len(train_loader)}')
          
         scheduler.step()
 
