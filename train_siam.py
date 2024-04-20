@@ -145,9 +145,14 @@ class ContrastiveLoss(nn.Module):
     def forward(self, output1, output2, label):
         # Euclidean distance between output1 and output2
         euclidean_distance = F.pairwise_distance(output1, output2, keepdim=True)
+        
+        # Ensure label tensor is correctly shaped for broadcasting
+        label = label.view(-1, 1)  # Reshaping labels to [batch_size, 1] if not already
         # Contrastive loss
         loss = torch.mean((1-label) * torch.pow(euclidean_distance, 2) +
                           (label) * torch.pow(torch.clamp(self.margin - euclidean_distance, min=0.0), 2))
+        
+        loss = torch.mean(loss)  # Averaging the loss over the batch
 
         return loss
 
