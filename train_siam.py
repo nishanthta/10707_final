@@ -144,7 +144,10 @@ class ContrastiveLoss(nn.Module):
 
     def forward(self, output1, output2, label):
         # Euclidean distance between output1 and output2
-        euclidean_distance = F.pairwise_distance(output1, output2, keepdim=True)
+        
+        output1_flat = output1.view(output1.size(0), -1)
+        output2_flat = output2.view(output2.size(0), -1)
+        euclidean_distance = F.pairwise_distance(output1_flat, output2_flat, keepdim=True)
         # Contrastive loss
         loss = torch.mean((1-label) * torch.pow(euclidean_distance, 2) +
                           (label) * torch.pow(torch.clamp(self.margin - euclidean_distance, min=0.0), 2))
@@ -154,7 +157,8 @@ class ContrastiveLoss(nn.Module):
 
 def train_model(model, mlp_model, train_loader, val_loader, device, patience):
     # criterion = JointsMSELoss().to(device)
-    criterion = nn.BCEWithLogitsLoss()
+    criterion_bce = nn.BCEWithLogitsLoss()
+    criterion_contrastive = ContrastiveLoss()
     optimizer = AdamW(model.parameters(), lr=0.001, betas=(0.9, 0.999), weight_decay=0.01)
     scheduler = StepLR(optimizer, step_size=10, gamma=0.1)
     scaler = GradScaler()
@@ -175,9 +179,17 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience):
             with autocast():
                 output1 = model(images[0])
                 output2 = model(images[1])
+                
+                # # Flatten or pool the outputs to reduce them to 2D
+                # output1 = F.adaptive_avg_pool2d(output1, (1, 1)).view(output1.size(0), -1)
+                # output2 = F.adaptive_avg_pool2d(output2, (1, 1)).view(output2.size(0), -1)
                 output = torch.reshape(torch.cat((output1, output2), dim=1), (batch_size, -1))
+                
+                # Verify outputs are correct for pairwise distance calculation
+                # print("Output1 shape:", output1.shape)  # Should be [batch_size, feature_length]
+                # print("Output2 shape:", output2.shape)
                 final_output = mlp_model(output)
-                loss = criterion(final_output, targets)
+                loss = criterion_bce(final_output, targets) + 1e-4*criterion_contrastive(output1, output2, targets)
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -197,8 +209,11 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience):
                 output1 = model(images[0])
                 output2 = model(images[1])
                 output = torch.reshape(torch.cat((output1, output2), dim=1), (targets.size(0), -1))
+                
                 final_output = mlp_model(output)
-                loss = criterion(final_output, targets)
+                output1 = output1.view(output1.size(0), -1)
+                output2 = output2.view(output2.size(0), -1)
+                loss = criterion_bce(final_output, targets) + criterion_contrastive(output1, output2, targets)
                 val_loss += loss.item()
                 
             avg_val_loss = val_loss / len(val_loader)
@@ -207,8 +222,10 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience):
 
         if avg_val_loss < min_loss:
             epochs_without_improvement = 0
-            torch.save(model, '/notebooks/ADL/ViTPose_pytorch/chkpts/vitpose_ckpt.pth')
-            torch.save(mlp_model, '/notebooks/ADL/ViTPose_pytorch/chkpts/mlp_ckpt.pth')
+            # torch.save(model, '/notebooks/ADL/ViTPose_pytorch/chkpts/finetuned_coco_b_cedar_vitpose_ckpt.pth')
+            # torch.save(mlp_model, '/notebooks/ADL/ViTPose_pytorch/chkpts/finetuned_coco_b_cedar_mlp_ckpt.pth')
+            torch.save(model, '/notebooks/ADL/ViTPose_pytorch/chkpts/scratch_vitpose_ckpt.pth')
+            torch.save(mlp_model, '/notebooks/ADL/ViTPose_pytorch/chkpts/scratch_mlp_ckpt.pth')
         
         else:
             epochs_without_improvement += 1
@@ -254,8 +271,9 @@ def main():
     criterion = nn.BCEWithLogitsLoss().to(device)
     
     # Path to the pretrained model checkpoint
-    checkpoint_path = '/notebooks/ADL/ViTPose_pytorch/chkpts/vitpose-b-multi-coco.pth'
-    # checkpoint_path = '/ViTPose_pytorch/chkpts/xyz.pth'
+    # checkpoint_path = '/notebooks/ADL/ViTPose_pytorch/chkpts/vitpose-b-multi-coco.pth'
+    checkpoint_path = '/ViTPose_pytorch/chkpts/xyz.pth'
+    # checkpoint_path = None
     
     if os.path.exists(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -280,7 +298,7 @@ def main():
         print("Pretrained model loaded successfully with adjustments.")
     else:
         print("Checkpoint file not found. Training from scratch.")
-
+ 
     
     # Load dataset
     # df = pd.read_csv('path_to_cedar_dataset.csv')  # Update path as necessary
