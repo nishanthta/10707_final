@@ -145,45 +145,18 @@ class ContrastiveLoss(nn.Module):
     def forward(self, output1, output2, label):
         # Euclidean distance between output1 and output2
         euclidean_distance = F.pairwise_distance(output1, output2, keepdim=True)
-        
-        # Ensure label tensor is correctly shaped for broadcasting
-        label = label.view(-1, 1)  # Reshaping labels to [batch_size, 1] if not already
         # Contrastive loss
         loss = torch.mean((1-label) * torch.pow(euclidean_distance, 2) +
                           (label) * torch.pow(torch.clamp(self.margin - euclidean_distance, min=0.0), 2))
-        
-        loss = torch.mean(loss)  # Averaging the loss over the batch
 
         return loss
 
-    
-def adjust_learning_rate(optimizer, epoch, warmup_epochs, total_rampup_epochs, base_lr, max_lr):
-    if epoch < warmup_epochs:
-        # Linear warmup
-        lr = base_lr + (max_lr - base_lr) * (epoch / warmup_epochs)
-    elif epoch < total_rampup_epochs:
-        # Linear ramp-up
-        lr = max_lr
-    else:
-        # Steady state
-        lr = max_lr
-
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-    
 
 def train_model(model, mlp_model, train_loader, val_loader, device, patience):
-    base_lr = 0.0001  # Low initial learning rate during warmup
-    max_lr = 0.001    # Target learning rate after warmup
-    warmup_epochs = 5
-    total_rampup_epochs = 15 
     # criterion = JointsMSELoss().to(device)
-    # criterion = nn.BCEWithLogitsLoss()
-    contrastive_loss = ContrastiveLoss().to(device)
-    bce_loss = torch.nn.BCEWithLogitsLoss().to(device)
-    
-    # optimizer = AdamW(model.parameters(), lr=0.001, betas=(0.9, 0.999), weight_decay=0.01)
-    optimizer = torch.optim.Adam(list(model.parameters()) + list(mlp_model.parameters()), lr=base_lr)
+    criterion_bce = nn.BCEWithLogitsLoss()
+    criterion_contrastive = ContrastiveLoss()
+    optimizer = AdamW(model.parameters(), lr=0.001, betas=(0.9, 0.999), weight_decay=0.01)
     scheduler = StepLR(optimizer, step_size=10, gamma=0.1)
     scaler = GradScaler()
     epochs_without_improvement, min_loss = 0, 1e8
@@ -191,7 +164,6 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience):
     model.train()
     mlp_model.train()
     for epoch in range(200):  # Number of epochs
-        adjust_learning_rate(optimizer, epoch, warmup_epochs, total_rampup_epochs, base_lr, max_lr)
         total_loss, val_loss = 0, 0
         for images, targets in tqdm(train_loader):
 
@@ -206,24 +178,13 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience):
                 output2 = model(images[1])
                 output = torch.reshape(torch.cat((output1, output2), dim=1), (batch_size, -1))
                 final_output = mlp_model(output)
-                
-                # Calculate both losses
-                cont_loss = contrastive_loss(output1, output2, 1 - targets)  # Assuming label=1 for dissimilar, 0 for similar
-                bce_loss = bce_loss(final_output, targets)
-                
-                # Combine losses
-                loss = cont_loss + bce_loss
+                loss = criterion_bce(final_output, targets) + 1e-4*criterion_contrastive(output1.view(-1), output2.view(-1), targets)
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
             total_loss += loss.item()
-            total_contrastive_loss += cont_loss.item()
-            
-        # After each epoch, print the average contrastive loss
-        avg_contrastive_loss = total_contrastive_loss / len(train_loader)
-        print(f'Epoch {epoch+1}, Avg Contrastive Loss: {avg_contrastive_loss}, Total Train Loss: {total_loss / len(train_loader)}')
          
         scheduler.step()
 
@@ -238,7 +199,7 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience):
                 output2 = model(images[1])
                 output = torch.reshape(torch.cat((output1, output2), dim=1), (targets.size(0), -1))
                 final_output = mlp_model(output)
-                loss = criterion(final_output, targets)
+                loss = criterion_bce(final_output, targets) + criterion_contrastive(output1.view(-1), output2.view(-1), targets)
                 val_loss += loss.item()
                 
             avg_val_loss = val_loss / len(val_loader)
@@ -247,8 +208,8 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience):
 
         if avg_val_loss < min_loss:
             epochs_without_improvement = 0
-            torch.save(model, '/notebooks/ADL/ViTPose_pytorch/chkpts/vitpose_ckpt.pth')
-            torch.save(mlp_model, '/notebooks/ADL/ViTPose_pytorch/chkpts/mlp_ckpt.pth')
+            torch.save(model, '/notebooks/ADL/ViTPose_pytorch/chkpts/finetuned_coco_b_cedar_vitpose_ckpt.pth')
+            torch.save(mlp_model, '/notebooks/ADL/ViTPose_pytorch/chkpts/finetuned_coco_b_cedar_mlp_ckpt.pth')
         
         else:
             epochs_without_improvement += 1
@@ -284,8 +245,8 @@ def save_model(model, epoch, loss, descriptor="ViTPose"):
         
 #         return avg_val_loss
 
-
-
+    
+    
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -294,8 +255,9 @@ def main():
     criterion = nn.BCEWithLogitsLoss().to(device)
     
     # Path to the pretrained model checkpoint
-    # checkpoint_path = '/notebooks/ADL/ViTPose_pytorch/chkpts/vitpose-b-multi-coco.pth'
-    checkpoint_path = '/ViTPose_pytorch/chkpts/xyz.pth' #fake path, to init train from scratch
+    checkpoint_path = '/notebooks/ADL/ViTPose_pytorch/chkpts/vitpose-b-multi-coco.pth'
+    # checkpoint_path = '/ViTPose_pytorch/chkpts/xyz.pth'
+    # checkpoint_path = None
     
     if os.path.exists(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location=device)
