@@ -20,6 +20,8 @@ from itertools import combinations, product
 from torch.utils.data import Dataset
 import datetime
 import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 def seed_everything(seed_value = 42):
     random.seed(seed_value)
@@ -159,6 +161,8 @@ class ContrastiveLoss(nn.Module):
 
 
 def train_model(model, mlp_model, train_loader, val_loader, device, patience):
+    train_losses = []
+    val_losses = []
     # criterion = JointsMSELoss().to(device)
     criterion_bce = nn.BCEWithLogitsLoss()
     criterion_contrastive = ContrastiveLoss()
@@ -197,10 +201,10 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience):
 
             scaler.scale(loss).backward()
 
-            # Print and analyze gradients
-            for name, param in model.named_parameters():
-                if param.grad is not None:
-                    print(f'Parameter: {name}, Gradient Norm: {param.grad.norm().item()}')
+            # # Print and analyze gradients
+            # for name, param in model.named_parameters():
+            #     if param.grad is not None:
+            #         print(f'Parameter: {name}, Gradient Norm: {param.grad.norm().item()}')
 
 
             clip_grad_norm_(model.parameters(), max_norm=1.0)  # Adjust max_norm as needed
@@ -236,10 +240,10 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience):
 
         if avg_val_loss < min_loss:
             epochs_without_improvement = 0
-            torch.save(model, '/data-fast/james/adl/chkpts/finetuned_coco_b_cedar_vitpose_ckpt.pth')
-            torch.save(mlp_model, '/data-fast/james/adl/chkpts/finetuned_coco_b_cedar_mlp_ckpt.pth')
-            # torch.save(model, '/home/jamesemi/Desktop/james/adl/ViTPose_pytorch/chkpts/scratch_cedar_vitpose_ckpt.pth')
-            # torch.save(mlp_model, '/home/jamesemi/Desktop/james/adl/ViTPose_pytorch/chkpts/scratch_cedar_mlp_ckpt.pth')
+            # torch.save(model, '/data-fast/james/adl/chkpts/finetuned_coco_b_cedar_vitpose_ckpt.pth')
+            # torch.save(mlp_model, '/data-fast/james/adl/chkpts/finetuned_coco_b_cedar_mlp_ckpt.pth')
+            torch.save(model, '/data-fast/james/adl/chkpts/scratch_cedar_vitpose_ckpt_apr22.pth')
+            torch.save(mlp_model, '/data-fast/james/adl/chkpts/scratch_cedar_mlp_ckpt_apr22.pth')
         
         else:
             epochs_without_improvement += 1
@@ -247,6 +251,13 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience):
                 print('Early stopping activated')
                 break
 
+        # Compute average losses
+        avg_train_loss = total_loss / len(train_loader)
+        avg_val_loss = val_loss / len(val_loader)
+
+        # Store losses
+        train_losses.append(avg_train_loss)
+        val_losses.append(avg_val_loss)
         
 
 
@@ -283,8 +294,8 @@ def main():
     criterion = nn.BCEWithLogitsLoss().to(device)
     
     # Path to the pretrained model checkpoint
-    checkpoint_path = '/data-fast/james/adl/chkpts/vitpose-b-multi-coco.pth'
-    # checkpoint_path = '/ViTPose_pytorch/chkpts/xyz.pth'
+    # checkpoint_path = '/data-fast/james/adl/chkpts/vitpose-b-multi-coco.pth'
+    checkpoint_path = '/ViTPose_pytorch/chkpts/xyz.pth'
     # checkpoint_path = None
     
     if os.path.exists(checkpoint_path):
@@ -340,8 +351,19 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
     
-    train_model(model, mlp_model, train_loader, val_loader, device, patience=10)
+    train_losses, val_losses = train_model(model, mlp_model, train_loader, val_loader, device, patience=10)
     
+    plt.figure(figsize=(10, 5))
+    sns.lineplot(x=range(1, len(train_losses) + 1), y=train_losses, label='Training Loss')
+    sns.lineplot(x=range(1, len(val_losses) + 1), y=val_losses, label='Validation Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Losses')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
 
 if __name__ == '__main__':
     main()
+    
