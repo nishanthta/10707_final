@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.nn.utils import clip_grad_norm_
 from torch.cuda.amp import autocast, GradScaler
 from torchvision import transforms
 from tqdm import tqdm
@@ -12,7 +13,8 @@ from models.backbone.vit import ViT
 from models.head.topdown_heatmap_simple_head import TopdownHeatmapSimpleHead
 from models.losses import JointsMSELoss
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import StepLR 
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from PIL import Image
 from itertools import combinations, product
 from torch.utils.data import Dataset
@@ -21,6 +23,7 @@ import numpy as np
 
 def seed_everything(seed_value = 42):
     random.seed(seed_value)
+
     np.random.seed(seed_value)
     torch.manual_seed(seed_value)
     if torch.cuda.is_available():
@@ -159,8 +162,9 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience):
     # criterion = JointsMSELoss().to(device)
     criterion_bce = nn.BCEWithLogitsLoss()
     criterion_contrastive = ContrastiveLoss()
-    optimizer = AdamW(model.parameters(), lr=0.001, betas=(0.9, 0.999), weight_decay=0.01)
-    scheduler = StepLR(optimizer, step_size=10, gamma=0.1)
+    optimizer = AdamW(model.parameters(), lr=0.01, betas=(0.9, 0.999), weight_decay=0.01)
+    # scheduler = StepLR(optimizer, step_size=10, gamma=0.1)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
     scaler = GradScaler()
     epochs_without_improvement, min_loss = 0, 1e8
 
@@ -192,12 +196,21 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience):
                 loss = criterion_bce(final_output, targets) + 1e-4*criterion_contrastive(output1, output2, targets)
 
             scaler.scale(loss).backward()
+
+            # Print and analyze gradients
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    print(f'Parameter: {name}, Gradient Norm: {param.grad.norm().item()}')
+
+
+            clip_grad_norm_(model.parameters(), max_norm=1.0)  # Adjust max_norm as needed
+
             scaler.step(optimizer)
             scaler.update()
 
             total_loss += loss.item()
          
-        scheduler.step()
+        # scheduler.step(val_loss)
 
         model.eval()
         mlp_model.eval()
@@ -219,13 +232,14 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience):
             avg_val_loss = val_loss / len(val_loader)
 
         print(f'Epoch {epoch+1}, Train Loss: {total_loss/len(train_loader)}, Val Loss : {avg_val_loss}')
+        scheduler.step(avg_val_loss)  # Pass the validation loss to the scheduler
 
         if avg_val_loss < min_loss:
             epochs_without_improvement = 0
-            # torch.save(model, '/notebooks/ADL/ViTPose_pytorch/chkpts/finetuned_coco_b_cedar_vitpose_ckpt.pth')
-            # torch.save(mlp_model, '/notebooks/ADL/ViTPose_pytorch/chkpts/finetuned_coco_b_cedar_mlp_ckpt.pth')
-            torch.save(model, '/notebooks/ADL/ViTPose_pytorch/chkpts/scratch_vitpose_ckpt.pth')
-            torch.save(mlp_model, '/notebooks/ADL/ViTPose_pytorch/chkpts/scratch_mlp_ckpt.pth')
+            torch.save(model, '/data-fast/james/adl/chkpts/finetuned_coco_b_cedar_vitpose_ckpt.pth')
+            torch.save(mlp_model, '/data-fast/james/adl/chkpts/finetuned_coco_b_cedar_mlp_ckpt.pth')
+            # torch.save(model, '/home/jamesemi/Desktop/james/adl/ViTPose_pytorch/chkpts/scratch_cedar_vitpose_ckpt.pth')
+            # torch.save(mlp_model, '/home/jamesemi/Desktop/james/adl/ViTPose_pytorch/chkpts/scratch_cedar_mlp_ckpt.pth')
         
         else:
             epochs_without_improvement += 1
@@ -261,8 +275,6 @@ def save_model(model, epoch, loss, descriptor="ViTPose"):
         
 #         return avg_val_loss
 
-    
-    
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -271,8 +283,8 @@ def main():
     criterion = nn.BCEWithLogitsLoss().to(device)
     
     # Path to the pretrained model checkpoint
-    # checkpoint_path = '/notebooks/ADL/ViTPose_pytorch/chkpts/vitpose-b-multi-coco.pth'
-    checkpoint_path = '/ViTPose_pytorch/chkpts/xyz.pth'
+    checkpoint_path = '/data-fast/james/adl/chkpts/vitpose-b-multi-coco.pth'
+    # checkpoint_path = '/ViTPose_pytorch/chkpts/xyz.pth'
     # checkpoint_path = None
     
     if os.path.exists(checkpoint_path):
@@ -308,9 +320,9 @@ def main():
     # Initialize dataset
     # dataset = DupletDatasetCEDAR(base_dir='OSV_2D/CEDAR', transform=transform)
     dirs = defaultdict(list)
-    dirs['train'] = '/notebooks/ADL/ViTPose_pytorch/datasets/CEDAR/train'
-    dirs['val'] = '/notebooks/ADL/ViTPose_pytorch/datasets/CEDAR/val'
-    dirs['test'] = '/notebooks/ADL/ViTPose_pytorch/datasets/CEDAR/test'
+    dirs['train'] = '/home/jamesemi/Desktop/james/adl/ViTPose_pytorch/datasets/CEDAR/train'
+    dirs['val'] = '/home/jamesemi/Desktop/james/adl/ViTPose_pytorch/datasets/CEDAR/val'
+    dirs['test'] = '/home/jamesemi/Desktop/james/adl/ViTPose_pytorch/datasets/CEDAR/test'
     
     train_signers = [name for name in os.listdir(dirs['train']) if os.path.isdir(os.path.join(dirs['train'], name))]
     val_signers = [name for name in os.listdir(dirs['val']) if os.path.isdir(os.path.join(dirs['val'], name))]
