@@ -22,6 +22,7 @@ import datetime
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+from efficientnet_pytorch import EfficientNet
 
 def seed_everything(seed_value = 42):
     random.seed(seed_value)
@@ -88,9 +89,9 @@ class DupletDatasetCEDAR(Dataset):
 # Example transformation
 transform = transforms.Compose([
     transforms.Resize((256, 256)),
-    transforms.Grayscale(num_output_channels=1),
+    transforms.Grayscale(num_output_channels=3),
     transforms.ToTensor()
-    # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]) # Normalization for EfficientNet
 ])
 
 
@@ -114,22 +115,28 @@ class ViTPose(nn.Module):
     def __init__(self):
         super(ViTPose, self).__init__()
         # Vision Transformer Backbone
-        self.backbone = ViT(
-            img_size=256, 
-            patch_size=16, 
-            in_chans=1, 
-            embed_dim=768, 
-            depth=12, 
-            num_heads=12, 
-            mlp_ratio=4,
-            qkv_bias=True,
-            drop_rate=0.1,
-            attn_drop_rate=0.1,
-            drop_path_rate=0.1
-        )
+        # Initialize EfficientNet
+        self.efficientnet = EfficientNet.from_pretrained('efficientnet-b0')
+        
+        # Optionally remove the top layer to use as a feature extractor
+        self.efficientnet._fc = nn.Identity()
+
+        # self.backbone = ViT(
+        #     img_size=256, 
+        #     patch_size=16, 
+        #     in_chans=1, 
+        #     embed_dim=768, 
+        #     depth=12, 
+        #     num_heads=12, 
+        #     mlp_ratio=4,
+        #     qkv_bias=True,
+        #     drop_rate=0.1,
+        #     attn_drop_rate=0.1,
+        #     drop_path_rate=0.1
+        # )
         # Initialize the keypoint head with 'extra' options
         self.keypoint_head = TopdownHeatmapSimpleHead(
-            in_channels=768,
+            in_channels=1280,  # This should match EfficientNet's output feature size for 'b0'
             out_channels=17,  # Assuming 17 keypoints
             num_deconv_layers=2,
             num_deconv_filters=(256, 256),
@@ -138,7 +145,8 @@ class ViTPose(nn.Module):
         )
         
     def forward(self, x):
-        x = self.backbone(x)
+        # x = self.backbone(x)
+        x = self.efficientnet(x)
         x = self.keypoint_head(x)
         return x
     
@@ -242,8 +250,8 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience):
             epochs_without_improvement = 0
             # torch.save(model, '/data-fast/james/adl/chkpts/finetuned_coco_b_cedar_vitpose_ckpt.pth')
             # torch.save(mlp_model, '/data-fast/james/adl/chkpts/finetuned_coco_b_cedar_mlp_ckpt.pth')
-            torch.save(model, '/data-fast/james/adl/chkpts/scratch_cedar_vitpose_ckpt_apr22.pth')
-            torch.save(mlp_model, '/data-fast/james/adl/chkpts/scratch_cedar_mlp_ckpt_apr22.pth')
+            torch.save(model, '/data-fast/james/adl/chkpts/effnet_cedar_vitpose_ckpt_apr23.pth')
+            torch.save(mlp_model, '/data-fast/james/adl/chkpts/effnet_cedar_mlp_ckpt_apr23.pth')
         
         else:
             epochs_without_improvement += 1
