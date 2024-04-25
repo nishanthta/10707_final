@@ -22,6 +22,7 @@ from torch.nn.utils import clip_grad_norm_
 import datetime
 import numpy as np
 import seaborn as sns
+from sklearn.metrics import roc_auc_score
 
 def seed_everything(seed_value = 42):
     random.seed(seed_value)
@@ -321,7 +322,7 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience, lr
         avg_val_loss = val_loss / len(val_loader)
         val_losses.append(avg_val_loss)
         scheduler.step(avg_val_loss)
-        
+
         print(f'Epoch {epoch+1}, Train Loss: {avg_train_loss}, Val Loss : {avg_val_loss}')
 
         if avg_val_loss < min_loss:
@@ -380,9 +381,31 @@ def test_model(model, mlp_model, test_loader, device):
     plt.xticks([0, 1], ['Forgery', 'Original'])
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     filename = f"/home/jamesemi/Desktop/james/adl/ViTPose_pytorch/figs/violin_plot_{timestamp}.pth"
-    plt.savefig('/home/jamesemi/Desktop/james/adl/ViTPose_pytorch/figs/violin_cocob_finetune.png', dpi=300)
+    plt.savefig(filename, dpi=300)
     return pos_distances, neg_distances
 
+def test_model_auc(model, mlp_model, test_loader, device):
+    model.eval()
+    mlp_model.eval()
+    distances = []
+    labels = []
+    with torch.no_grad():
+        for images, targets in tqdm(test_loader):
+            images = [image.to(device) for image in images]
+            targets = targets.to(device)
+            output1 = model(images[0])
+            output2 = model(images[1])
+            distance = F.pairwise_distance(output1.view(output1.shape[0], -1), output2.view(output2.shape[0], -1)).squeeze().cpu().numpy()
+            distances.extend(distance)
+            labels.extend(targets.cpu().numpy())
+
+    # Convert distances to a similarity score or keep as is depending on your approach
+    # Here assuming that lower distance means higher similarity (common in contrastive learning)
+    similarities = 1 / (1 + np.array(distances))  # Example conversion, adjust based on your specific needs
+    auc_score = roc_auc_score(labels, similarities)  # Calculate AUC based on the similarity scores
+
+    print(f"AUC Score: {auc_score}")
+    return auc_score
 
 def save_model(model, epoch, loss, descriptor="ViTPose"):
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -419,12 +442,16 @@ def main():
     mlp_model = MLPClassifier(input_dim=34*64*64, hidden_dim=512, output_dim=1).to(device) #update this
     # mlp_model = MLPClassifier(input_dim=34*64*64, hidden_dim=512, output_dim=1).to(device) #update this
     # model = torch.load('/home/nthumbav/Downloads/ViTPose_pytorch/vitpose_ckpt.pth')
+
     # Path to the pretrained model checkpoint
     checkpoint_path = '/data-fast/james/adl/chkpts/vitpose-b-multi-coco.pth'
+
+
+    #fake path
     # checkpoint_path = '/ViTPose_pytorch/chkpts/xyz.pth'
     # checkpoint_path = None
 
-    num_epochs = 50
+    num_epochs = 100
     learning_rate = 1e-3
     
     if os.path.exists(checkpoint_path):
@@ -481,11 +508,21 @@ def main():
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
     
     #uncomment below for testing
-    # test_model(model, mlp_model, test_loader, device)
+    
+    # Path to the finetuned model checkpoint
+    checkpoint_path = '/home/jamesemi/Desktop/james/adl/ViTPose_pytorch/vitpose_lr0.001_epoch3_valloss0.0167.pth'
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    # print("Available keys in checkpoint:", checkpoint.keys())
+    # state_dict = checkpoint['model_state_dict']
+    final_model = ViTPose().to(device)
+    final_model.load_state_dict(checkpoint)
+    print("Final model loaded from given checkpoint file:", checkpoint_path)
+    test_model(final_model, mlp_model, test_loader, device)
+    test_model_auc(final_model, mlp_model, test_loader, device)
 
     #uncomment below for training run
-    train_losses, val_losses = train_model(model, mlp_model, train_loader, val_loader, device, patience=5, lr=learning_rate, num_epochs=num_epochs)
-    plot_losses(train_losses, val_losses, learning_rate, num_epochs)
+    # train_losses, val_losses = train_model(model, mlp_model, train_loader, val_loader, device, patience=5, lr=learning_rate, num_epochs=num_epochs)
+    # plot_losses(train_losses, val_losses, learning_rate, num_epochs)
 
 
     
