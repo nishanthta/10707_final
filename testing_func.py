@@ -1,55 +1,54 @@
 import torch
-from train_poseresnet import SimplePoseResNet  # Import your model class here
-from train_poseresnet import DupletDatasetCEDAR  # Import your dataset class here
+from torch.utils.data import DataLoader
 from torchvision import transforms
+from train_poseresnet import SimplePoseResNet, MLPClassifier, DupletDatasetCEDAR
 
 def test_training_step():
-    # Load a small portion of the dataset for testing
+    # Define transformations for the images
     transform = transforms.Compose([
-    transforms.Resize((256, 256)),
-    transforms.Grayscale(num_output_channels=3),
-    transforms.ToTensor()
-    # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]) # Normalization for EfficientNet
+        transforms.Resize((256, 256)),
+        transforms.Grayscale(num_output_channels=3),
+        transforms.ToTensor()
     ])
-    test_loader = torch.utils.data.DataLoader(
-        DupletDatasetCEDAR(train=False, transform=transform),  # Assuming you have transforms
-        batch_size=10,  # Small batch size for quick testing
-        shuffle=True
-    )
 
-    # Initialize the model
-    model = SimplePoseResNet()
-    model.train()
+    # Initialize the dataset and dataloader for testing
+    test_dataset = DupletDatasetCEDAR(base_dir='/home/jamesemi/Desktop/james/adl/ViTPose_pytorch/datasets/CEDAR/train', signers=['1'], transform=transform)
+    test_loader = DataLoader(test_dataset, batch_size=2, shuffle=True)  # Small batch size for testing
 
-    # Optionally, move model to GPU
+    # Device configuration
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
 
-    # Define a loss function
-    criterion = torch.nn.CrossEntropyLoss()  # Example loss function, change as needed
+    # Initialize the model components
+    model = SimplePoseResNet(num_joints=40).to(device)
+    mlp_model = MLPClassifier(input_dim=5120, hidden_dim=512, output_dim=1).to(device)
 
-    # Define an optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    # Define the criterion and optimizer
+    criterion = torch.nn.BCEWithLogitsLoss().to(device)
+    optimizer = torch.optim.AdamW(list(model.parameters()) + list(mlp_model.parameters()), lr=0.01)
 
-    # Run a single mini-batch to test
-    for inputs, labels in test_loader:
-        inputs, labels = inputs.to(device), labels.to(device)
+    # Test forward and backward pass
+    model.train()
+    mlp_model.train()
+    for images, targets in test_loader:
+        images = [image.to(device) for image in images]
+        targets = targets.to(device)
 
         # Forward pass
-        outputs = model(inputs)
-        loss = criterion(outputs, labels)
+        output1 = model(images[0])
+        output2 = model(images[1])
+        output = torch.cat((output1, output2), dim=1)
+        final_output = mlp_model(output)
 
-        # Backward pass and optimize
+        # Loss computation
+        loss = criterion(final_output, targets)
+
+        # Backward pass
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        # Check for any non-finite numbers in outputs
-        if not torch.isfinite(loss):
-            print("Non-finite loss encountered.")
-        else:
-            print("Loss computed successfully: ", loss.item())
-        break  # Only one batch for testing
+        print(f'Test loss: {loss.item()}')
+        break  # Run the test for only one batch
 
 if __name__ == "__main__":
     test_training_step()
