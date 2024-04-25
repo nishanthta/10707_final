@@ -40,7 +40,7 @@ def seed_everything(seed_value = 42):
 
 
 class DupletDatasetCEDAR(Dataset):
-    def __init__(self, base_dir, signers, transform=None):
+    def __init__(self, base_dir, signers, transform=None, limit=None):
         """
         Initialize the dataset with the directory of images and transforms.
         base_dir: The directory that contains subdirectories of original and forgery images.
@@ -48,24 +48,29 @@ class DupletDatasetCEDAR(Dataset):
         """
         self.transform = transform
         self.signers = signers
-        self.pairs, self.labels = self._create_pairs(base_dir)
+        self.pairs, self.labels = self._create_pairs(base_dir, limit)
         self.base_dir = base_dir
 
-    def _create_pairs(self, base_dir):
+    def _create_pairs(self, base_dir, limit):
         pairs = []
         labels = []
-        # Walk through the directory
         for signer in self.signers:
             subdir = os.path.join(base_dir, signer)
             originals = [os.path.join(subdir, f) for f in os.listdir(subdir) if 'original' in f]
             forgeries = [os.path.join(subdir, f) for f in os.listdir(subdir) if 'forgeries' in f]
 
             original_pairs = list(combinations(originals, 2))
+            forgery_pairs = list(product(originals, forgeries))
+            print('original pairs length', len(original_pairs))
+            print('forgery pairs length', len(forgery_pairs))
+
+            if limit:
+                original_pairs = original_pairs[:limit]
+                forgery_pairs = forgery_pairs[:limit]
+
             for pair in original_pairs:
                 pairs.append(pair)
                 labels.append(0)
-
-            forgery_pairs = list(product(originals, forgeries))
             for pair in forgery_pairs:
                 pairs.append(pair)
                 labels.append(1)
@@ -144,7 +149,7 @@ class MLPClassifier(nn.Module):
 
     
 class ContrastiveLoss(nn.Module):
-    def __init__(self, margin=1.0):
+    def __init__(self, margin=0.5):
         super(ContrastiveLoss, self).__init__()
         self.margin = margin
 
@@ -169,7 +174,7 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience, in
     criterion_contrastive = ContrastiveLoss()
     optimizer = AdamW(model.parameters(), lr=0.01, betas=(0.9, 0.999), weight_decay=0.01)
     # scheduler = StepLR(optimizer, step_size=10, gamma=0.1)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=1, verbose=True)
     scaler = GradScaler()
     epochs_without_improvement, min_loss = 0, 1e8
 
@@ -265,8 +270,8 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience, in
             epochs_without_improvement = 0
             # torch.save(model, '/data-fast/james/adl/chkpts/finetuned_coco_b_cedar_vitpose_ckpt.pth')
             # torch.save(mlp_model, '/data-fast/james/adl/chkpts/finetuned_coco_b_cedar_mlp_ckpt.pth')
-            torch.save(model, '/data-fast/james/adl/chkpts/poseresnet_cedar_vitpose_ckpt_apr24_40joints.pth')
-            torch.save(mlp_model, '/data-fast/james/adl/chkpts/poseresnet_cedar_mlp_ckpt_apr24_40joints.pth')
+            torch.save(model, '/data-fast/james/adl/chkpts/poseresnet_cedar_vitpose_ckpt_apr24_40joints_50pairs_margin05.pth')
+            torch.save(mlp_model, '/data-fast/james/adl/chkpts/poseresnet_cedar_mlp_ckpt_apr24_40joints_50pairs_margin05.pth')
         
         else:
             epochs_without_improvement += 1
@@ -366,9 +371,10 @@ def main():
     #COMMENT OUT THE FOLLOWING TEST
     # train_signers, val_signers = train_signers[:5], val_signers[:2]
 
-    train_dataset = DupletDatasetCEDAR(dirs['train'], transform=transform, signers=train_signers)
-    val_dataset = DupletDatasetCEDAR(dirs['val'], transform=transform, signers=val_signers)
-    test_dataset = DupletDatasetCEDAR(dirs['test'], transform=transform, signers=test_signers)
+    limit = 50
+    train_dataset = DupletDatasetCEDAR(dirs['train'], transform=transform, signers=train_signers, limit=limit)
+    val_dataset = DupletDatasetCEDAR(dirs['val'], transform=transform, signers=val_signers, limit=limit)
+    test_dataset = DupletDatasetCEDAR(dirs['test'], transform=transform, signers=test_signers, limit=limit)
     
     # Load datasets
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
