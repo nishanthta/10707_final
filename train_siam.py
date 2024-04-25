@@ -5,7 +5,6 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.nn.utils import clip_grad_norm_
 from torch.cuda.amp import autocast, GradScaler
 from torchvision import transforms
 from tqdm import tqdm
@@ -13,20 +12,16 @@ from models.backbone.vit import ViT
 from models.head.topdown_heatmap_simple_head import TopdownHeatmapSimpleHead
 from models.losses import JointsMSELoss
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import StepLR 
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import StepLR
 from PIL import Image
 from itertools import combinations, product
 from torch.utils.data import Dataset
+from torch.nn.utils import clip_grad_norm_
 import datetime
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from efficientnet_pytorch import EfficientNet
 
 def seed_everything(seed_value = 42):
     random.seed(seed_value)
-
     np.random.seed(seed_value)
     torch.manual_seed(seed_value)
     if torch.cuda.is_available():
@@ -89,11 +84,64 @@ class DupletDatasetCEDAR(Dataset):
 # Example transformation
 transform = transforms.Compose([
     transforms.Resize((256, 256)),
-    transforms.Grayscale(num_output_channels=3),
+    transforms.Grayscale(num_output_channels=1),
     transforms.ToTensor()
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]) # Normalization for EfficientNet
+    # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
+class CapsuleLayer(nn.Module):
+    def __init__(self, num_capsules, num_route_nodes, in_channels, out_channels, kernel_size=None, stride=None, num_iterations=3):
+        super(CapsuleLayer, self).__init__()
+        self.num_route_nodes = num_route_nodes
+        self.num_capsules = num_capsules
+        self.num_iterations = num_iterations
+        
+        if num_route_nodes != -1:
+            self.route_weights = nn.Parameter(torch.randn(num_capsules, num_route_nodes, in_channels, out_channels))
+        else:
+            self.capsules = nn.ModuleList([
+                nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=0)
+                for _ in range(num_capsules)])
+
+    def squash(self, tensor, dim=-1):
+        squared_norm = (tensor ** 2).sum(dim=dim, keepdim=True)
+        scale = squared_norm / (1 + squared_norm)
+        return scale * tensor / torch.sqrt(squared_norm)
+
+    def forward(self, x):
+        if self.num_route_nodes != -1:
+            priors = x[None, :, :, None, :] @ self.route_weights[:, None, :, :, :]
+            logits = torch.zeros(*priors.size(), device=x.device)
+            for i in range(self.num_iterations):
+                probs = F.softmax(logits, dim=2)
+                outputs = self.squash((probs * priors).sum(dim=2, keepdim=True))
+                if i < self.num_iterations - 1:
+                    logits = logits + (priors * outputs).sum(dim=-1, keepdim=True)
+            return outputs.squeeze(3)
+        else:
+            outputs = [capsule(x) for capsule in self.capsules]
+            outputs = torch.stack(outputs, dim=1)
+            outputs = outputs.view(x.size(0), self.num_capsules, -1)
+            return self.squash(outputs)
+
+class CapsNet(nn.Module):
+    def __init__(self, image_channels, primary_capsules, primary_dim, num_classes, out_dim, num_routing):
+        super(CapsNet, self).__init__()
+        self.conv_layer = nn.Conv2d(image_channels, 256, kernel_size=9, stride=1)
+        # Adjust primary capsules to properly handle outputs
+        self.primary_capsules = CapsuleLayer(num_capsules=primary_capsules, num_route_nodes=-1, in_channels=256,
+                                             out_channels=primary_dim, kernel_size=9, stride=2)
+        # Here, consider adjusting `num_route_nodes` for digit_capsules based on primary_capsules output
+        self.digit_capsules = CapsuleLayer(num_capsules=num_classes, num_route_nodes=32*1152, # Example, calculate the actual number based on the output from primary_capsules
+                                           in_channels=primary_dim, out_channels=out_dim, num_iterations=num_routing)
+
+    def forward(self, x):
+        x = F.relu(self.conv_layer(x), inplace=True)
+        x = self.primary_capsules(x)
+        x = x.view(x.size(0), -1, x.size(-1))
+        x = self.digit_capsules(x)
+        lengths = x.norm(dim=-1)
+        return x, lengths
 
 class MLPClassifier(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
@@ -115,28 +163,22 @@ class ViTPose(nn.Module):
     def __init__(self):
         super(ViTPose, self).__init__()
         # Vision Transformer Backbone
-        # Initialize EfficientNet
-        self.efficientnet = EfficientNet.from_pretrained('efficientnet-b0')
-        
-        # Optionally remove the top layer to use as a feature extractor
-        self.efficientnet._fc = nn.Identity()
-
-        # self.backbone = ViT(
-        #     img_size=256, 
-        #     patch_size=16, 
-        #     in_chans=1, 
-        #     embed_dim=768, 
-        #     depth=12, 
-        #     num_heads=12, 
-        #     mlp_ratio=4,
-        #     qkv_bias=True,
-        #     drop_rate=0.1,
-        #     attn_drop_rate=0.1,
-        #     drop_path_rate=0.1
-        # )
+        self.backbone = ViT(
+            img_size=256, 
+            patch_size=16, 
+            in_chans=1, 
+            embed_dim=768, 
+            depth=12, 
+            num_heads=12, 
+            mlp_ratio=4,
+            qkv_bias=True,
+            drop_rate=0.1,
+            attn_drop_rate=0.1,
+            drop_path_rate=0.1
+        )
         # Initialize the keypoint head with 'extra' options
         self.keypoint_head = TopdownHeatmapSimpleHead(
-            in_channels=1280,  # This should match EfficientNet's output feature size for 'b0'
+            in_channels=768,
             out_channels=17,  # Assuming 17 keypoints
             num_deconv_layers=2,
             num_deconv_filters=(256, 256),
@@ -145,8 +187,7 @@ class ViTPose(nn.Module):
         )
         
     def forward(self, x):
-        # x = self.backbone(x)
-        x = self.efficientnet(x)
+        x = self.backbone(x)
         x = self.keypoint_head(x)
         return x
     
@@ -157,26 +198,66 @@ class ContrastiveLoss(nn.Module):
 
     def forward(self, output1, output2, label):
         # Euclidean distance between output1 and output2
-        
-        output1_flat = output1.view(output1.size(0), -1)
-        output2_flat = output2.view(output2.size(0), -1)
-        euclidean_distance = F.pairwise_distance(output1_flat, output2_flat, keepdim=True)
+        euclidean_distance = F.pairwise_distance(output1, output2, keepdim=True)
         # Contrastive loss
         loss = torch.mean((1-label) * torch.pow(euclidean_distance, 2) +
                           (label) * torch.pow(torch.clamp(self.margin - euclidean_distance, min=0.0), 2))
 
+        if torch.isnan(loss):
+            print('Nan')
         return loss
 
+class PointwiseContrastiveLoss(nn.Module):
+    def __init__(self, margin=1.0):
+        super(PointwiseContrastiveLoss, self).__init__()
+        self.margin = margin
+
+    def forward(self, output1, output2, label):
+        # Ensure label is broadcastable to the output size
+        label = label.view(-1, 1, 1, 1).expand_as(output1)
+        
+        # Calculate pairwise cosine similarity
+        cosine_sim = F.cosine_similarity(output1, output2, dim=1, eps=1e-6)
+
+        # Calculate pairwise distance
+        euclidean_dist = F.pairwise_distance(output1.view(output1.size(0), -1),
+                                             output2.view(output2.size(0), -1),
+                                             keepdim=True).view_as(output1)
+
+        # Calculate loss for positive and negative pairs
+        positive_loss = 1 - cosine_sim  # Maximize cosine similarity for positive pairs
+        negative_loss = F.relu(euclidean_dist - self.margin)  # Ensure distance is beyond a margin for negative pairs
+
+        # Apply labels to determine which loss to use for each pixel
+        loss = torch.where(label == 1, positive_loss, negative_loss)
+
+        return loss.mean()
+
+class SiameseCapsNet(nn.Module):
+    def __init__(self, image_channels, primary_capsules, primary_dim, num_classes, out_dim, num_routing):
+        super(SiameseCapsNet, self).__init__()
+        self.capsnet = CapsNet(image_channels, primary_capsules, primary_dim, num_classes, out_dim, num_routing)
+
+    def forward(self, x1, x2):
+        output1, _ = self.capsnet(x1)
+        output2, _ = self.capsnet(x2)
+        return output1, output2
+
+def contrastive_loss(output1, output2, label, margin=1.0):
+    # Euclidean distance between output1 and output2
+    euclidean_distance = F.pairwise_distance(output1, output2)
+    # Contrastive loss
+    loss = torch.mean((1-label) * torch.pow(euclidean_distance, 2) +
+                      label * torch.pow(torch.clamp(margin - euclidean_distance, min=0.0), 2))
+    return loss
 
 def train_model(model, mlp_model, train_loader, val_loader, device, patience):
-    train_losses = []
-    val_losses = []
     # criterion = JointsMSELoss().to(device)
     criterion_bce = nn.BCEWithLogitsLoss()
     criterion_contrastive = ContrastiveLoss()
-    optimizer = AdamW(model.parameters(), lr=0.01, betas=(0.9, 0.999), weight_decay=0.01)
-    # scheduler = StepLR(optimizer, step_size=10, gamma=0.1)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+    # criterion_cosine = nn.CosineEmbeddingLoss(margin=0.5).to(device)
+    optimizer = AdamW(model.parameters(), lr=1e-4, betas=(0.9, 0.999), weight_decay=0.01)
+    scheduler = StepLR(optimizer, step_size=10, gamma=0.1)
     scaler = GradScaler()
     epochs_without_improvement, min_loss = 0, 1e8
 
@@ -189,40 +270,25 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience):
             images = [image.to(device) for image in images]
             targets = targets.to(device)
             batch_size = targets.size(0)            
+            targets_cosine = torch.where(targets == 1, 1, -1)  # Assuming binary targets: 1 for similar, -1 for dissimilar
 
             optimizer.zero_grad()
 
             with autocast():
                 output1 = model(images[0])
                 output2 = model(images[1])
-                
-                # # Flatten or pool the outputs to reduce them to 2D
-                # output1 = F.adaptive_avg_pool2d(output1, (1, 1)).view(output1.size(0), -1)
-                # output2 = F.adaptive_avg_pool2d(output2, (1, 1)).view(output2.size(0), -1)
                 output = torch.reshape(torch.cat((output1, output2), dim=1), (batch_size, -1))
-                
-                # Verify outputs are correct for pairwise distance calculation
-                # print("Output1 shape:", output1.shape)  # Should be [batch_size, feature_length]
-                # print("Output2 shape:", output2.shape)
                 final_output = mlp_model(output)
-                loss = criterion_bce(final_output, targets) + 1e-4*criterion_contrastive(output1, output2, targets)
+                # loss = criterion_bce(final_output, targets) + 1e-4*criterion_contrastive(output1.view(-1), output2.view(-1), targets)
+                loss = criterion_contrastive(output1.view(output1.shape[0], -1), output2.view(output1.shape[0], -1), targets)
 
             scaler.scale(loss).backward()
-
-            # # Print and analyze gradients
-            # for name, param in model.named_parameters():
-            #     if param.grad is not None:
-            #         print(f'Parameter: {name}, Gradient Norm: {param.grad.norm().item()}')
-
-
-            clip_grad_norm_(model.parameters(), max_norm=1.0)  # Adjust max_norm as needed
-
             scaler.step(optimizer)
             scaler.update()
 
             total_loss += loss.item()
          
-        # scheduler.step(val_loss)
+        scheduler.step()
 
         model.eval()
         mlp_model.eval()
@@ -231,27 +297,24 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience):
             for images, targets in tqdm(val_loader):
                 images = [image.to(device) for image in images]
                 targets = targets.to(device)
+                targets_cosine = torch.where(targets == 1, 1, -1)  # Assuming binary targets: 1 for similar, -1 for dissimilar
                 output1 = model(images[0])
                 output2 = model(images[1])
                 output = torch.reshape(torch.cat((output1, output2), dim=1), (targets.size(0), -1))
-                
                 final_output = mlp_model(output)
-                output1 = output1.view(output1.size(0), -1)
-                output2 = output2.view(output2.size(0), -1)
-                loss = criterion_bce(final_output, targets) + criterion_contrastive(output1, output2, targets)
+                # loss = criterion_bce(final_output, targets) + criterion_contrastive(output1.view(-1), output2.view(-1), targets)
+                loss = criterion_contrastive(output1.view(output1.shape[0], -1), output2.view(output1.shape[0], -1), targets)
+                # loss = criterion_cosine(output1, output2, targets_cosine)
                 val_loss += loss.item()
                 
             avg_val_loss = val_loss / len(val_loader)
 
         print(f'Epoch {epoch+1}, Train Loss: {total_loss/len(train_loader)}, Val Loss : {avg_val_loss}')
-        scheduler.step(avg_val_loss)  # Pass the validation loss to the scheduler
 
         if avg_val_loss < min_loss:
             epochs_without_improvement = 0
-            # torch.save(model, '/data-fast/james/adl/chkpts/finetuned_coco_b_cedar_vitpose_ckpt.pth')
-            # torch.save(mlp_model, '/data-fast/james/adl/chkpts/finetuned_coco_b_cedar_mlp_ckpt.pth')
-            torch.save(model, '/data-fast/james/adl/chkpts/effnet_cedar_vitpose_ckpt_apr23.pth')
-            torch.save(mlp_model, '/data-fast/james/adl/chkpts/effnet_cedar_mlp_ckpt_apr23.pth')
+            torch.save(model, '/home/nthumbav/Downloads/ViTPose_pytorch/vitpose_ckpt.pth')
+            torch.save(mlp_model, '/home/nthumbav/Downloads/ViTPose_pytorch/mlp_ckpt.pth')
         
         else:
             epochs_without_improvement += 1
@@ -259,14 +322,21 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience):
                 print('Early stopping activated')
                 break
 
-        # Compute average losses
-        avg_train_loss = total_loss / len(train_loader)
-        avg_val_loss = val_loss / len(val_loader)
 
-        # Store losses
-        train_losses.append(avg_train_loss)
-        val_losses.append(avg_val_loss)
-        
+
+
+def test_model(model, mlp_model, test_loader, device):
+    model.eval()
+    mlp_model.eval()
+    with torch.no_grad():
+        for images, targets in tqdm(test_loader):
+            images = [image.to(device) for image in images]
+            targets = targets.to(device)
+            output1 = model(images[0])
+            output2 = model(images[1])
+            output = torch.reshape(torch.cat((output1, output2), dim=1), (targets.size(0), -1))
+            final_output = mlp_model(output)
+            
 
 
 def save_model(model, epoch, loss, descriptor="ViTPose"):
@@ -294,42 +364,45 @@ def save_model(model, epoch, loss, descriptor="ViTPose"):
         
 #         return avg_val_loss
 
+    
+    
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # model = SiameseCapsNet(image_channels=1, primary_capsules=32, primary_dim=8, num_classes=10, out_dim=16, num_routing=3).to(device)
     model = ViTPose().to(device)
     mlp_model = MLPClassifier(input_dim=34*64*64, hidden_dim=512, output_dim=1).to(device) #update this
-    criterion = nn.BCEWithLogitsLoss().to(device)
-    
+    # mlp_model = MLPClassifier(input_dim=34*64*64, hidden_dim=512, output_dim=1).to(device) #update this
+      
     # Path to the pretrained model checkpoint
-    # checkpoint_path = '/data-fast/james/adl/chkpts/vitpose-b-multi-coco.pth'
-    checkpoint_path = '/ViTPose_pytorch/chkpts/xyz.pth'
-    # checkpoint_path = None
+    # checkpoint_path = '/notebooks/ADL/ViTPose_pytorch/chkpts/vitpose-b-multi-coco.pth'
+    # # checkpoint_path = '/ViTPose_pytorch/chkpts/xyz.pth'
+    # # checkpoint_path = None
     
-    if os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        state_dict = checkpoint['state_dict']
+    # if os.path.exists(checkpoint_path):
+    #     checkpoint = torch.load(checkpoint_path, map_location=device)
+    #     state_dict = checkpoint['state_dict']
 
-        # Adjust the first convolutional layer weights
-        # Average the RGB channels weights to fit grayscale input
-        first_conv_weight = state_dict['backbone.patch_embed.proj.weight']
-        first_conv_weight_mean = first_conv_weight.mean(dim=1, keepdim=True)
-        state_dict['backbone.patch_embed.proj.weight'] = first_conv_weight_mean
+    #     # Adjust the first convolutional layer weights
+    #     # Average the RGB channels weights to fit grayscale input
+    #     first_conv_weight = state_dict['backbone.patch_embed.proj.weight']
+    #     first_conv_weight_mean = first_conv_weight.mean(dim=1, keepdim=True)
+    #     state_dict['backbone.patch_embed.proj.weight'] = first_conv_weight_mean
 
-        # Resize positional embeddings if necessary
-        pos_embed = state_dict['backbone.pos_embed']
-        current_pos_embed = model.backbone.pos_embed
-        if pos_embed.shape != current_pos_embed.shape:
-            # Interpolate positional embeddings
-            new_pos_embed = F.interpolate(pos_embed.permute(0, 2, 1), size=current_pos_embed.shape[-2], mode='linear', align_corners=True)
-            state_dict['backbone.pos_embed'] = new_pos_embed.permute(0, 2, 1)
+    #     # Resize positional embeddings if necessary
+    #     pos_embed = state_dict['backbone.pos_embed']
+    #     current_pos_embed = model.backbone.pos_embed
+    #     if pos_embed.shape != current_pos_embed.shape:
+    #         # Interpolate positional embeddings
+    #         new_pos_embed = F.interpolate(pos_embed.permute(0, 2, 1), size=current_pos_embed.shape[-2], mode='linear', align_corners=True)
+    #         state_dict['backbone.pos_embed'] = new_pos_embed.permute(0, 2, 1)
 
-        # Load the adjusted state dict
-        model.load_state_dict(state_dict, strict=False)
-        print("Pretrained model loaded successfully with adjustments.")
-    else:
-        print("Checkpoint file not found. Training from scratch.")
- 
+    #     # Load the adjusted state dict
+    #     model.load_state_dict(state_dict, strict=False)
+    #     print("Pretrained model loaded successfully with adjustments.")
+    # else:
+    #     print("Checkpoint file not found. Training from scratch.")
+
     
     # Load dataset
     # df = pd.read_csv('path_to_cedar_dataset.csv')  # Update path as necessary
@@ -339,16 +412,16 @@ def main():
     # Initialize dataset
     # dataset = DupletDatasetCEDAR(base_dir='OSV_2D/CEDAR', transform=transform)
     dirs = defaultdict(list)
-    dirs['train'] = '/home/jamesemi/Desktop/james/adl/ViTPose_pytorch/datasets/CEDAR/train'
-    dirs['val'] = '/home/jamesemi/Desktop/james/adl/ViTPose_pytorch/datasets/CEDAR/val'
-    dirs['test'] = '/home/jamesemi/Desktop/james/adl/ViTPose_pytorch/datasets/CEDAR/test'
+    dirs['train'] = '/home/nthumbav/Downloads/OSV_2D/CEDAR/train'
+    dirs['val'] = '/home/nthumbav/Downloads/OSV_2D/CEDAR/val'
+    dirs['test'] = '/home/nthumbav/Downloads/OSV_2D/CEDAR/test'
     
     train_signers = [name for name in os.listdir(dirs['train']) if os.path.isdir(os.path.join(dirs['train'], name))]
     val_signers = [name for name in os.listdir(dirs['val']) if os.path.isdir(os.path.join(dirs['val'], name))]
     test_signers = [name for name in os.listdir(dirs['test']) if os.path.isdir(os.path.join(dirs['test'], name))]
     
     #COMMENT OUT THE FOLLOWING TEST
-    # train_signers, val_signers = train_signers[:5], val_signers[:2]
+    # train_signers, val_signers = train_signers[:2], val_signers[:1]
 
     train_dataset = DupletDatasetCEDAR(dirs['train'], transform=transform, signers=train_signers)
     val_dataset = DupletDatasetCEDAR(dirs['val'], transform=transform, signers=val_signers)
@@ -359,19 +432,8 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
     
-    train_losses, val_losses = train_model(model, mlp_model, train_loader, val_loader, device, patience=10)
+    train_model(model, mlp_model, train_loader, val_loader, device, patience=10)
     
-    plt.figure(figsize=(10, 5))
-    sns.lineplot(x=range(1, len(train_losses) + 1), y=train_losses, label='Training Loss')
-    sns.lineplot(x=range(1, len(val_losses) + 1), y=val_losses, label='Validation Loss')
-    plt.xlabel('Epochs')
-    plt.ylabel('Loss')
-    plt.title('Training and Validation Losses')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
-
 
 if __name__ == '__main__':
     main()
-    
