@@ -24,6 +24,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from efficientnet_pytorch import EfficientNet
 from torchvision.models import resnet50
+from sklearn.metrics import roc_auc_score
 
 def seed_everything(seed_value = 42):
     random.seed(seed_value)
@@ -61,8 +62,8 @@ class DupletDatasetCEDAR(Dataset):
 
             original_pairs = list(combinations(originals, 2))
             forgery_pairs = list(product(originals, forgeries))
-            print('original pairs length', len(original_pairs))
-            print('forgery pairs length', len(forgery_pairs))
+            # print('original pairs length', len(original_pairs))
+            # print('forgery pairs length', len(forgery_pairs))
 
             if limit:
                 original_pairs = original_pairs[:limit]
@@ -183,7 +184,6 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience, in
     bce_weight = 0.0 # Start with a smaller weight for BCE
 
 
-
     model.train()
     mlp_model.train()
     for epoch in range(200):  # Number of epochs
@@ -199,28 +199,11 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience, in
             with autocast():
                 output1 = model(images[0])
                 output2 = model(images[1])
-                
-                # # Flatten or pool the outputs to reduce them to 2D
-                # output1 = F.adaptive_avg_pool2d(output1, (1, 1)).view(output1.size(0), -1)
-                # output2 = F.adaptive_avg_pool2d(output2, (1, 1)).view(output2.size(0), -1)
-                output = torch.reshape(torch.cat((output1, output2), dim=1), (batch_size, -1))
-                
-                # Verify outputs are correct for pairwise distance calculation
-                # print("Output1 shape:", output1.shape)  # Should be [batch_size, feature_length]
-                # print("Output2 shape:", output2.shape)
+                output = torch.reshape(torch.cat((output1, output2), dim=1), (targets.size(0), -1))
                 final_output = mlp_model(output)
-                classification_loss = criterion_bce(final_output, targets)
-                contrastive_loss = criterion_contrastive(output1, output2, targets)
-                # loss = classification_loss + 1e-4 * contrastive_loss
-
-                # Adjusting the loss based on the epoch
-                if epoch < initial_epochs:
-                    loss = contrastive_weight * contrastive_loss + bce_weight * classification_loss
-                else:
-                    # Gradually change the weighting after initial epochs
-                    contrastive_weight = max(contrastive_weight - 0.1, 0.1)  # Decrease contrastive weight
-                    bce_weight = min(bce_weight + 0.1, 1.0)  # Increase BCE weight
-                    loss = contrastive_weight * contrastive_loss + bce_weight * classification_loss
+                classification_loss = nn.BCEWithLogitsLoss()(final_output, targets)
+                contrastive_loss = ContrastiveLoss()(output1, output2, targets)
+                loss = contrastive_loss + 1e-4 * classification_loss
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -314,13 +297,76 @@ def save_model(model, epoch, loss, descriptor="ViTPose"):
 #         avg_val_loss = val_loss / len(dataloader)
         
 #         return avg_val_loss
+def test_model(model, mlp_model, test_loader, device):
+    model.eval()
+    mlp_model.eval()
+    pos_distances, neg_distances = [], []  # Lists to store distances for positive and negative pairs
+    distances = []
+    labels = []
+    
+    with torch.no_grad():
+        for images, targets in tqdm(test_loader):
+            images = [image.to(device) for image in images]
+            targets = targets.to(device)
+            
+            output1 = model(images[0])
+            output2 = model(images[1])
+            output = torch.cat((output1, output2), dim=1)
+            final_output = mlp_model(output)
+            
+            euclidean_distance = F.pairwise_distance(output1, output2).item()
+            distances.append(euclidean_distance)
+            labels.append(targets.item())
 
+            if targets.item() == 1:
+                pos_distances.append(euclidean_distance)
+            else:
+                neg_distances.append(euclidean_distance)
+
+    # Calculate AUC score assuming that a smaller distance indicates a match
+    auc_score = roc_auc_score(labels, 1 - np.array(distances))  # Convert distances to similarities
+    print(f"AUC Score: {auc_score}")
+
+    # Create the violin plot
+    sns.set(style="whitegrid")
+    plt.figure(figsize=(8, 6))
+    sns.violinplot(data=[pos_distances, neg_distances])
+    plt.xticks([0, 1], ['Positive Pairs', 'Negative Pairs'])
+    plt.title('Distribution of Distances Between Pairs')
+    plt.ylabel('Euclidean Distance')
+    plt.show()
+
+    return pos_distances, neg_distances, auc_score
+
+def plot_losses(train_losses, val_losses):
+    sns.set(style="whitegrid")  # Set the style of the plot using seaborn
+    plt.figure(figsize=(10, 5))  # Set the size of the plot
+    plt.title('Training and Validation Loss')  # Set the title of the plot
+
+    # Plot training and validation loss
+    sns.lineplot(x=range(1, len(train_losses)+1), y=train_losses, label='Training Loss', linewidth=2.5)
+    sns.lineplot(x=range(1, len(val_losses)+1), y=val_losses, label='Validation Loss', linewidth=2.5)
+
+    plt.xlabel('Epochs')  # Label for the x-axis
+    plt.ylabel('Loss')  # Label for the y-axis
+    plt.legend()  # Add a legend
+    plt.tight_layout()  # Automatically adjust subplot parameters to give specified padding
+    
+    plt.savefig('training_validation_loss.png')  # Save the plot to a file
+    plt.show()
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = SimplePoseResNet(num_joints=40).to(device)
     mlp_model = MLPClassifier(input_dim=5120, hidden_dim=512, output_dim=1).to(device) #update this
     criterion = nn.BCEWithLogitsLoss().to(device)
+
+    # Setup transforms
+    transform = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.Grayscale(num_output_channels=3),
+        transforms.ToTensor()
+    ])
     
     # Path to the pretrained model checkpoint
     # checkpoint_path = '/data-fast/james/adl/chkpts/vitpose-b-multi-coco.pth'
@@ -332,7 +378,7 @@ def main():
         state_dict = checkpoint['state_dict']
 
         # Adjust the first convolutional layer weights
-        # Average the RGB channels weights to fit grayscale input
+        # Average the RGB channcels weights to fit grayscale input
         first_conv_weight = state_dict['backbone.patch_embed.proj.weight']
         first_conv_weight_mean = first_conv_weight.mean(dim=1, keepdim=True)
         state_dict['backbone.patch_embed.proj.weight'] = first_conv_weight_mean
@@ -381,17 +427,30 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
     
-    train_losses, val_losses = train_model(model, mlp_model, train_loader, val_loader, device, patience=10)
+    # train_losses, val_losses = train_model(model, mlp_model, train_loader, val_loader, device, patience=10)
     
-    plt.figure(figsize=(10, 5))
-    sns.lineplot(x=range(1, len(train_losses) + 1), y=train_losses, label='Training Loss')
-    sns.lineplot(x=range(1, len(val_losses) + 1), y=val_losses, label='Validation Loss')
-    plt.xlabel('Epochs')
-    plt.ylabel('Loss')
-    plt.title('Training and Validation Losses')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+    # Parameters for training
+    lr = 0.001
+    num_epochs = 50
+    patience = 10
+
+    # # Train and validate
+    # train_losses, val_losses = train_model(model, mlp_model, train_loader, val_loader, device, patience, lr, num_epochs)
+    # plot_losses(train_losses, val_losses, lr, num_epochs)
+
+
+    #uncomment below for testing
+    
+    # Path to the finetuned model checkpoint
+    checkpoint_path = '/data-fast/james/adl/chkpts/poseresnet_cedar_mlp_ckpt_apr24_40joints_50pairs.pth'
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    # print("Available keys in checkpoint:", checkpoint.keys())
+    # state_dict = checkpoint['model_state_dict']
+    final_model = SimplePoseResNet(num_joints=40).to(device)
+    final_model.load_state_dict(checkpoint.get('state_dict', checkpoint))  # Fallback to checkpoint if 'state_dict' key is not found
+    print("Final model loaded from given checkpoint file:", checkpoint_path)
+    test_model(final_model, mlp_model, test_loader, device)
+    # test_model_auc(final_model, mlp_model, test_loader, device)
 
 
 if __name__ == '__main__':
