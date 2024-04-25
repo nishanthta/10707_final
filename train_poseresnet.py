@@ -167,13 +167,13 @@ class ContrastiveLoss(nn.Module):
         return loss
 
 
-def train_model(model, mlp_model, train_loader, val_loader, device, patience, initial_epochs=5):
+def train_model(model, mlp_model, train_loader, val_loader, device, patience, lr, num_epochs, initial_epochs=5):
     train_losses = []
     val_losses = []
     # criterion = JointsMSELoss().to(device)
     criterion_bce = nn.BCEWithLogitsLoss()
     criterion_contrastive = ContrastiveLoss()
-    optimizer = AdamW(model.parameters(), lr=0.01, betas=(0.9, 0.999), weight_decay=0.01)
+    optimizer = AdamW(model.parameters(), lr=lr, betas=(0.9, 0.999), weight_decay=0.01)
     # scheduler = StepLR(optimizer, step_size=10, gamma=0.1)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=1, verbose=True)
     scaler = GradScaler()
@@ -249,12 +249,13 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience, in
         print(f'Epoch {epoch+1}, Train Loss: {total_loss/len(train_loader)}, Val Loss : {avg_val_loss}')
         scheduler.step(avg_val_loss)  # Pass the validation loss to the scheduler
 
+        # Dynamic checkpoint saving
         if avg_val_loss < min_loss:
-            epochs_without_improvement = 0
-            # torch.save(model, '/data-fast/james/adl/chkpts/finetuned_coco_b_cedar_vitpose_ckpt.pth')
-            # torch.save(mlp_model, '/data-fast/james/adl/chkpts/finetuned_coco_b_cedar_mlp_ckpt.pth')
-            torch.save(model, '/data-fast/james/adl/chkpts/poseresnet_cedar_vitpose_ckpt_apr24_40joints_50pairs_margin05.pth')
-            torch.save(mlp_model, '/data-fast/james/adl/chkpts/poseresnet_cedar_mlp_ckpt_apr24_40joints_50pairs_margin05.pth')
+            min_loss = avg_val_loss
+            timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            checkpoint_filename = f'model_epoch{epoch+1}_lr{lr}_valloss{avg_val_loss:.4f}_{timestamp}.pth'
+            torch.save(model.state_dict(), checkpoint_filename)
+            torch.save(mlp_model.state_dict(), checkpoint_filename.replace("model", "mlp_model"))
         
         else:
             epochs_without_improvement += 1
@@ -334,25 +335,27 @@ def test_model(model, mlp_model, test_loader, device):
     plt.xticks([0, 1], ['Positive Pairs', 'Negative Pairs'])
     plt.title('Distribution of Distances Between Pairs')
     plt.ylabel('Euclidean Distance')
+    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    plot_filename = f'violinplot_{timestamp}.png'
+    plt.savefig(plot_filename)
+
     plt.show()
 
     return pos_distances, neg_distances, auc_score
 
-def plot_losses(train_losses, val_losses):
-    sns.set(style="whitegrid")  # Set the style of the plot using seaborn
-    plt.figure(figsize=(10, 5))  # Set the size of the plot
-    plt.title('Training and Validation Loss')  # Set the title of the plot
-
-    # Plot training and validation loss
-    sns.lineplot(x=range(1, len(train_losses)+1), y=train_losses, label='Training Loss', linewidth=2.5)
-    sns.lineplot(x=range(1, len(val_losses)+1), y=val_losses, label='Validation Loss', linewidth=2.5)
-
-    plt.xlabel('Epochs')  # Label for the x-axis
-    plt.ylabel('Loss')  # Label for the y-axis
-    plt.legend()  # Add a legend
-    plt.tight_layout()  # Automatically adjust subplot parameters to give specified padding
-    
-    plt.savefig('training_validation_loss.png')  # Save the plot to a file
+def plot_losses(train_losses, val_losses, lr, num_epochs):
+    plt.figure(figsize=(10, 5))
+    sns.lineplot(range(1, len(train_losses)+1), train_losses, label='Train Loss')
+    sns.lineplot(range(1, len(val_losses)+1), val_losses, label='Validation Loss')
+    plt.title(f'Training and Validation Loss: LR={lr}, Epochs={num_epochs}')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    plot_filename = f'training_validation_loss_lr{lr}_epochs{num_epochs}_{timestamp}.png'
+    plt.savefig(plot_filename)
     plt.show()
 
 def main():
@@ -417,10 +420,13 @@ def main():
     #COMMENT OUT THE FOLLOWING TEST
     # train_signers, val_signers = train_signers[:5], val_signers[:2]
 
-    limit = 50
-    train_dataset = DupletDatasetCEDAR(dirs['train'], transform=transform, signers=train_signers, limit=limit)
-    val_dataset = DupletDatasetCEDAR(dirs['val'], transform=transform, signers=val_signers, limit=limit)
-    test_dataset = DupletDatasetCEDAR(dirs['test'], transform=transform, signers=test_signers, limit=limit)
+    # limit = 50
+    # train_dataset = DupletDatasetCEDAR(dirs['train'], transform=transform, signers=train_signers, limit=limit)
+    # val_dataset = DupletDatasetCEDAR(dirs['val'], transform=transform, signers=val_signers, limit=limit)
+    # test_dataset = DupletDatasetCEDAR(dirs['test'], transform=transform, signers=test_signers, limit=limit)
+    train_dataset = DupletDatasetCEDAR(dirs['train'], transform=transform, signers=train_signers)
+    val_dataset = DupletDatasetCEDAR(dirs['val'], transform=transform, signers=val_signers)
+    test_dataset = DupletDatasetCEDAR(dirs['test'], transform=transform, signers=test_signers)
     
     # Load datasets
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
@@ -434,25 +440,26 @@ def main():
     num_epochs = 50
     patience = 10
 
-    # # Train and validate
-    # train_losses, val_losses = train_model(model, mlp_model, train_loader, val_loader, device, patience, lr, num_epochs)
-    # plot_losses(train_losses, val_losses, lr, num_epochs)
+    # Train and validate
+    train_losses, val_losses = train_model(model, mlp_model, train_loader, val_loader, device, patience, lr, num_epochs)
+    plot_losses(train_losses, val_losses, lr, num_epochs)
 
 
     #uncomment below for testing
     
-    # Path to the finetuned model checkpoint
-    checkpoint_path = '/data-fast/james/adl/chkpts/poseresnet_cedar_mlp_ckpt_apr24_40joints_50pairs.pth'
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    # print("Available keys in checkpoint:", checkpoint.keys())
-    # state_dict = checkpoint['model_state_dict']
-    final_model = SimplePoseResNet(num_joints=40).to(device)
-    final_model.load_state_dict(checkpoint.get('state_dict', checkpoint))  # Fallback to checkpoint if 'state_dict' key is not found
-    print("Final model loaded from given checkpoint file:", checkpoint_path)
-    test_model(final_model, mlp_model, test_loader, device)
-    # test_model_auc(final_model, mlp_model, test_loader, device)
+    # # Path to the finetuned model checkpoint
+    # checkpoint_path = '/data-fast/james/adl/chkpts/poseresnet_cedar_mlp_ckpt_apr24_40joints_50pairs.pth'
+    # checkpoint = torch.load(checkpoint_path, map_location=device)
+    # # print("Available keys in checkpoint:", checkpoint.keys())
+    # # state_dict = checkpoint['model_state_dict']
+    # final_model = SimplePoseResNet(num_joints=40).to(device)
+    # final_model.load_state_dict(checkpoint.get('state_dict', checkpoint))  # Fallback to checkpoint if 'state_dict' key is not found
+    # print("Final model loaded from given checkpoint file:", checkpoint_path)
+    # test_model(final_model, mlp_model, test_loader, device)
+    # # test_model_auc(final_model, mlp_model, test_loader, device)
 
 
 if __name__ == '__main__':
     main()
+
     
