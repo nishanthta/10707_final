@@ -142,48 +142,6 @@ class MLPClassifier(nn.Module):
         x = self.fc3(x)
         return x
 
-class ViTPose(nn.Module):
-    def __init__(self):
-        super(ViTPose, self).__init__()
-        # Vision Transformer Backbone
-        # Initialize EfficientNet
-        self.efficientnet = EfficientNet.from_pretrained('efficientnet-b0')
-        
-        # Optionally remove the top layer to use as a feature extractor
-        self.efficientnet._fc = nn.Identity()
-
-        # self.backbone = ViT(
-        #     img_size=256, 
-        #     patch_size=16, 
-        #     in_chans=1, 
-        #     embed_dim=768, 
-        #     depth=12, 
-        #     num_heads=12, 
-        #     mlp_ratio=4,
-        #     qkv_bias=True,
-        #     drop_rate=0.1,
-        #     attn_drop_rate=0.1,
-        #     drop_path_rate=0.1
-        # )
-        # Initialize the keypoint head with 'extra' options
-        self.keypoint_head = TopdownHeatmapSimpleHead(
-            in_channels=1280,  # This should match EfficientNet's output feature size for 'b0'
-            out_channels=17,  # Assuming 17 keypoints
-            num_deconv_layers=2,
-            num_deconv_filters=(256, 256),
-            num_deconv_kernels=(4, 4),
-            extra={'final_conv_kernel': 1}  # Setting the final conv kernel size
-        )
-        
-    def forward(self, x):
-        # x = self.backbone(x)
-        x = self.efficientnet(x)
-        x = self.keypoint_head(x)
-        # Reshape the output from the backbone to include spatial dimensions if it's flattened
-        # Assuming the output is flat, you need to know the expected height and width
-        # For example, if the expected size is 16x16, reshape accordingly
-        x = x.view(x.size(0), 1280, 16, 16)  # Adjust 1280, 16, 16 based on actual sizes and requirements
-        return x
     
 class ContrastiveLoss(nn.Module):
     def __init__(self, margin=1.0):
@@ -203,7 +161,7 @@ class ContrastiveLoss(nn.Module):
         return loss
 
 
-def train_model(model, mlp_model, train_loader, val_loader, device, patience):
+def train_model(model, mlp_model, train_loader, val_loader, device, patience, initial_epochs=5):
     train_losses = []
     val_losses = []
     # criterion = JointsMSELoss().to(device)
@@ -214,6 +172,12 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience):
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
     scaler = GradScaler()
     epochs_without_improvement, min_loss = 0, 1e8
+
+     # Initial settings for loss weighting
+    contrastive_weight = 1.0
+    bce_weight = 0.0 # Start with a smaller weight for BCE
+
+
 
     model.train()
     mlp_model.train()
@@ -242,9 +206,20 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience):
                 final_output = mlp_model(output)
                 classification_loss = criterion_bce(final_output, targets)
                 contrastive_loss = criterion_contrastive(output1, output2, targets)
-                loss = classification_loss + 1e-4 * contrastive_loss
+                # loss = classification_loss + 1e-4 * contrastive_loss
+
+                # Adjusting the loss based on the epoch
+                if epoch < initial_epochs:
+                    loss = contrastive_weight * contrastive_loss + bce_weight * classification_loss
+                else:
+                    # Gradually change the weighting after initial epochs
+                    contrastive_weight = max(contrastive_weight - 0.1, 0.1)  # Decrease contrastive weight
+                    bce_weight = min(bce_weight + 0.1, 1.0)  # Increase BCE weight
+                    loss = contrastive_weight * contrastive_loss + bce_weight * classification_loss
 
             scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             # # Print and analyze gradients
             # for name, param in model.named_parameters():
@@ -253,9 +228,6 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience):
 
 
             clip_grad_norm_(model.parameters(), max_norm=1.0)  # Adjust max_norm as needed
-
-            scaler.step(optimizer)
-            scaler.update()
 
             total_loss += loss.item()
 
@@ -277,7 +249,10 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience):
                 final_output = mlp_model(output)
                 output1 = output1.view(output1.size(0), -1)
                 output2 = output2.view(output2.size(0), -1)
-                loss = criterion_bce(final_output, targets) + criterion_contrastive(output1, output2, targets)
+                contrastive_loss = criterion_contrastive(output1, output2, targets)
+                classification_loss = criterion_bce(final_output, targets)
+                loss = contrastive_weight * contrastive_loss + bce_weight * classification_loss
+                # loss = criterion_bce(final_output, targets) + criterion_contrastive(output1, output2, targets)
                 val_loss += loss.item()
                 
             avg_val_loss = val_loss / len(val_loader)
@@ -290,8 +265,8 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience):
             epochs_without_improvement = 0
             # torch.save(model, '/data-fast/james/adl/chkpts/finetuned_coco_b_cedar_vitpose_ckpt.pth')
             # torch.save(mlp_model, '/data-fast/james/adl/chkpts/finetuned_coco_b_cedar_mlp_ckpt.pth')
-            torch.save(model, '/data-fast/james/adl/chkpts/poseresnet_cedar_vitpose_ckpt_apr24.pth')
-            torch.save(mlp_model, '/data-fast/james/adl/chkpts/poseresnet_cedar_mlp_ckpt_apr24.pth')
+            torch.save(model, '/data-fast/james/adl/chkpts/poseresnet_cedar_vitpose_ckpt_apr24_40joints.pth')
+            torch.save(mlp_model, '/data-fast/james/adl/chkpts/poseresnet_cedar_mlp_ckpt_apr24_40joints.pth')
         
         else:
             epochs_without_improvement += 1
@@ -307,6 +282,7 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience):
         train_losses.append(avg_train_loss)
         val_losses.append(avg_val_loss)
         
+    return train_losses, val_losses
 
 
 def save_model(model, epoch, loss, descriptor="ViTPose"):
@@ -337,8 +313,8 @@ def save_model(model, epoch, loss, descriptor="ViTPose"):
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = SimplePoseResNet(num_joints=17).to(device)
-    mlp_model = MLPClassifier(input_dim=2176, hidden_dim=512, output_dim=1).to(device) #update this
+    model = SimplePoseResNet(num_joints=40).to(device)
+    mlp_model = MLPClassifier(input_dim=5120, hidden_dim=512, output_dim=1).to(device) #update this
     criterion = nn.BCEWithLogitsLoss().to(device)
     
     # Path to the pretrained model checkpoint
