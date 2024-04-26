@@ -371,34 +371,8 @@ def main():
         transforms.ToTensor()
     ])
     
-    # Path to the pretrained model checkpoint
-    # checkpoint_path = '/data-fast/james/adl/chkpts/vitpose-b-multi-coco.pth'
-    checkpoint_path = '/ResNetPose/chkpts/xyz.pth'
-    # checkpoint_path = None
     
-    if os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        state_dict = checkpoint['state_dict']
-
-        # Adjust the first convolutional layer weights
-        # Average the RGB channcels weights to fit grayscale input
-        first_conv_weight = state_dict['backbone.patch_embed.proj.weight']
-        first_conv_weight_mean = first_conv_weight.mean(dim=1, keepdim=True)
-        state_dict['backbone.patch_embed.proj.weight'] = first_conv_weight_mean
-
-        # Resize positional embeddings if necessary
-        pos_embed = state_dict['backbone.pos_embed']
-        current_pos_embed = model.backbone.pos_embed
-        if pos_embed.shape != current_pos_embed.shape:
-            # Interpolate positional embeddings
-            new_pos_embed = F.interpolate(pos_embed.permute(0, 2, 1), size=current_pos_embed.shape[-2], mode='linear', align_corners=True)
-            state_dict['backbone.pos_embed'] = new_pos_embed.permute(0, 2, 1)
-
-        # Load the adjusted state dict
-        model.load_state_dict(state_dict, strict=False)
-        print("Pretrained model loaded successfully with adjustments.")
-    else:
-        print("Checkpoint file not found. Training from scratch.")
+    print("Checkpoint file not found. Training from scratch.")
  
     
     # Load dataset
@@ -440,23 +414,24 @@ def main():
     num_epochs = 50
     patience = 10
 
-    # Train and validate
-    train_losses, val_losses = train_model(model, mlp_model, train_loader, val_loader, device, patience, lr, num_epochs)
-    plot_losses(train_losses, val_losses, lr, num_epochs)
+    # # Train and validate
+    # train_losses, val_losses = train_model(model, mlp_model, train_loader, val_loader, device, patience, lr, num_epochs)
+    # plot_losses(train_losses, val_losses, lr, num_epochs)
 
 
     #uncomment below for testing
     
-    # # Path to the finetuned model checkpoint
-    # checkpoint_path = '/data-fast/james/adl/chkpts/poseresnet_cedar_mlp_ckpt_apr24_40joints_50pairs.pth'
-    # checkpoint = torch.load(checkpoint_path, map_location=device)
-    # # print("Available keys in checkpoint:", checkpoint.keys())
-    # # state_dict = checkpoint['model_state_dict']
-    # final_model = SimplePoseResNet(num_joints=40).to(device)
+    # Path to the finetuned model checkpoint
+    checkpoint_path = '/home/jamesemi/Desktop/james/adl/ViTPose_pytorch/model_epoch1_lr0.001_valloss0.1695_20240425-195051.pth'
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    # print("Available keys in checkpoint:", checkpoint.keys())
+    # state_dict = checkpoint['model_state_dict']
+    final_model = SimplePoseResNet(num_joints=40).to(device)
     # final_model.load_state_dict(checkpoint.get('state_dict', checkpoint))  # Fallback to checkpoint if 'state_dict' key is not found
-    # print("Final model loaded from given checkpoint file:", checkpoint_path)
-    # test_model(final_model, mlp_model, test_loader, device)
-    # # test_model_auc(final_model, mlp_model, test_loader, device)
+    final_model.load_state_dict(checkpoint)
+    print("Final model loaded from given checkpoint file:", checkpoint_path)
+    test_model(final_model, mlp_model, test_loader, device)
+    # test_model_auc(final_model, mlp_model, test_loader, device)
 
 
 if __name__ == '__main__':
