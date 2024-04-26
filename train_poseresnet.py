@@ -166,6 +166,10 @@ class ContrastiveLoss(nn.Module):
 
         return loss
 
+def ensure_directory_exists(path):
+    if not os.path.exists(path):
+        os.makedirs(path)
+
 
 def train_model(model, mlp_model, train_loader, val_loader, device, patience, lr, num_epochs, initial_epochs=5):
     train_losses = []
@@ -180,13 +184,15 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience, lr
     epochs_without_improvement, min_loss = 0, 1e8
 
      # Initial settings for loss weighting
-    contrastive_weight = 1.0
-    bce_weight = 0.0 # Start with a smaller weight for BCE
+    contrastive_weight = 9.9
+    bce_weight = 0.1 # Start with a smaller weight for BCE
+    criterion_bce = nn.BCEWithLogitsLoss()
+    criterion_contrastive = ContrastiveLoss()
 
 
     model.train()
     mlp_model.train()
-    for epoch in range(200):  # Number of epochs
+    for epoch in range(num_epochs):  # Number of epochs
         total_loss, val_loss = 0, 0
         for images, targets in tqdm(train_loader):
 
@@ -201,27 +207,24 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience, lr
                 output2 = model(images[1])
                 output = torch.reshape(torch.cat((output1, output2), dim=1), (targets.size(0), -1))
                 final_output = mlp_model(output)
-                classification_loss = nn.BCEWithLogitsLoss()(final_output, targets)
-                contrastive_loss = ContrastiveLoss()(output1, output2, targets)
-                loss = contrastive_loss + 1e-4 * classification_loss
+                classification_loss = criterion_bce(final_output, targets)
+                contrastive_loss = criterion_contrastive(output1, output2, targets)
+                loss = contrastive_weight * contrastive_loss + bce_weight * classification_loss
+
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-
             # # Print and analyze gradients
             # for name, param in model.named_parameters():
             #     if param.grad is not None:
             #         print(f'Parameter: {name}, Gradient Norm: {param.grad.norm().item()}')
-
-
             clip_grad_norm_(model.parameters(), max_norm=1.0)  # Adjust max_norm as needed
 
             total_loss += loss.item()
 
         avg_train_loss = total_loss / len(train_loader)
         train_losses.append(avg_train_loss)
-
 
         model.eval()
         mlp_model.eval()
@@ -242,9 +245,9 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience, lr
                 loss = contrastive_weight * contrastive_loss + bce_weight * classification_loss
                 # loss = criterion_bce(final_output, targets) + criterion_contrastive(output1, output2, targets)
                 val_loss += loss.item()
-                
-            avg_val_loss = val_loss / len(val_loader)
-            val_losses.append(avg_val_loss)
+
+        avg_val_loss = val_loss / len(val_loader)
+        val_losses.append(avg_val_loss)
 
         print(f'Epoch {epoch+1}, Train Loss: {total_loss/len(train_loader)}, Val Loss : {avg_val_loss}')
         scheduler.step(avg_val_loss)  # Pass the validation loss to the scheduler
@@ -253,26 +256,24 @@ def train_model(model, mlp_model, train_loader, val_loader, device, patience, lr
         if avg_val_loss < min_loss:
             min_loss = avg_val_loss
             timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-            checkpoint_filename = f'model_epoch{epoch+1}_lr{lr}_valloss{avg_val_loss:.4f}_{timestamp}.pth'
+            checkpoint_filename = f'resnet_model_epoch{epoch+1}_lr{lr}_valloss{avg_val_loss:.4f}_{timestamp}.pth'
             torch.save(model.state_dict(), checkpoint_filename)
-            torch.save(mlp_model.state_dict(), checkpoint_filename.replace("model", "mlp_model"))
+            torch.save(mlp_model.state_dict(), checkpoint_filename.replace("resnet_model", "mlp_model"))
         
         else:
             epochs_without_improvement += 1
             if epochs_without_improvement >= patience:
                 print('Early stopping activated')
                 break
-
-        # Compute average losses
-        avg_train_loss = total_loss / len(train_loader)
-        avg_val_loss = val_loss / len(val_loader)
-
-        # Store losses
-        train_losses.append(avg_train_loss)
-        val_losses.append(avg_val_loss)
-        
+    
+    results_dir = './results/losses'
+    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    train_loss_path = os.path.join(results_dir, f'train_losses_{timestamp}.npy')
+    val_loss_path = os.path.join(results_dir, f'val_losses_{timestamp}.npy')
+    ensure_directory_exists(results_dir)  # Make sure the directory exists
+    np.save(train_loss_path, np.array(train_losses))
+    np.save(val_loss_path, np.array(val_losses))
     return train_losses, val_losses
-
 
 def save_model(model, epoch, loss, descriptor="ViTPose"):
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -315,14 +316,22 @@ def test_model(model, mlp_model, test_loader, device):
             output = torch.cat((output1, output2), dim=1)
             final_output = mlp_model(output)
             
-            euclidean_distance = F.pairwise_distance(output1, output2).item()
-            distances.append(euclidean_distance)
-            labels.append(targets.item())
+            # euclidean_distance = F.pairwise_distance(output1, output2).item()
+            # euclidean_distance = F.pairwise_distance(output1, output2).item()
+            distance = F.pairwise_distance(output1.view(output1.shape[0], -1), output2.view(output1.shape[0], -1), keepdim=True)
+            distances.extend(distance.cpu().numpy())
+            labels.extend(targets.cpu().numpy())  # Add this line to correctly collect labels
 
-            if targets.item() == 1:
-                pos_distances.append(euclidean_distance)
-            else:
-                neg_distances.append(euclidean_distance)
+            # Process each distance and label in the batch
+            for dist, label in zip(distance, targets):
+                if label.item() == 1:
+                    pos_distances.append(dist.item())
+                else:
+                    neg_distances.append(dist.item())
+            
+            print(f"Positive distances collected: {len(pos_distances)}, Negative distances: {len(neg_distances)}")
+
+    data = [pos_distances, neg_distances]
 
     # Calculate AUC score assuming that a smaller distance indicates a match
     auc_score = roc_auc_score(labels, 1 - np.array(distances))  # Convert distances to similarities
@@ -331,7 +340,7 @@ def test_model(model, mlp_model, test_loader, device):
     # Create the violin plot
     sns.set(style="whitegrid")
     plt.figure(figsize=(8, 6))
-    sns.violinplot(data=[pos_distances, neg_distances])
+    sns.violinplot(data=data)
     plt.xticks([0, 1], ['Positive Pairs', 'Negative Pairs'])
     plt.title('Distribution of Distances Between Pairs')
     plt.ylabel('Euclidean Distance')
@@ -410,31 +419,30 @@ def main():
     # train_losses, val_losses = train_model(model, mlp_model, train_loader, val_loader, device, patience=10)
     
     # Parameters for training
-    lr = 0.001
+    lr = 0.000001
     num_epochs = 50
     patience = 10
 
-    # # Train and validate
-    # train_losses, val_losses = train_model(model, mlp_model, train_loader, val_loader, device, patience, lr, num_epochs)
-    # plot_losses(train_losses, val_losses, lr, num_epochs)
+    # Train and validate
+    print('Learning rate is:', lr)
+    train_losses, val_losses = train_model(model, mlp_model, train_loader, val_loader, device, patience, lr, num_epochs)
+    plot_losses(train_losses, val_losses, lr, num_epochs)
 
 
     #uncomment below for testing
     
-    # Path to the finetuned model checkpoint
-    checkpoint_path = '/home/jamesemi/Desktop/james/adl/ViTPose_pytorch/model_epoch1_lr0.001_valloss0.1695_20240425-195051.pth'
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    # print("Available keys in checkpoint:", checkpoint.keys())
-    # state_dict = checkpoint['model_state_dict']
-    final_model = SimplePoseResNet(num_joints=40).to(device)
-    # final_model.load_state_dict(checkpoint.get('state_dict', checkpoint))  # Fallback to checkpoint if 'state_dict' key is not found
-    final_model.load_state_dict(checkpoint)
-    print("Final model loaded from given checkpoint file:", checkpoint_path)
-    test_model(final_model, mlp_model, test_loader, device)
-    # test_model_auc(final_model, mlp_model, test_loader, device)
+    ## Path to the finetuned model checkpoint
+    # checkpoint_path = '/home/jamesemi/Desktop/james/adl/ViTPose_pytorch/model_epoch1_lr0.001_valloss0.1695_20240425-195051.pth'
+    # checkpoint = torch.load(checkpoint_path, map_location=device)
+    # # print("Available keys in checkpoint:", checkpoint.keys())
+    # # state_dict = checkpoint['model_state_dict']
+    # final_model = SimplePoseResNet(num_joints=40).to(device)
+    # # final_model.load_state_dict(checkpoint.get('state_dict', checkpoint))  # Fallback to checkpoint if 'state_dict' key is not found
+    # final_model.load_state_dict(checkpoint)
+    # print("Final model loaded from given checkpoint file:", checkpoint_path)
+    # test_model(final_model, mlp_model, test_loader, device)
+    # # test_model_auc(final_model, mlp_model, test_loader, device)
 
 
 if __name__ == '__main__':
     main()
-
-    
