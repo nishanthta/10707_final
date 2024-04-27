@@ -3,6 +3,7 @@ Welcome to our repo!!
 Herein is documented our work towards building the VitSigNet model, which was the result of our curiosity as to whether pose vectors could serves as a useful feature by themselves in the task of forgery detection in handwritten signatures. 
 
 Clone this repo, and make sure to run `pip install -r requirements.txt`.
+(plese note that you'll need an environemnt that has `python >=3.7,<3.11` for the `requirements.txt` to successfully install. For this, you can use `pyenv` or an equivalent tool.
 
 Then, follow the instructions in `demo.ipynb` to see a test run of the models we have trained.
 
