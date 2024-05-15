@@ -10,4 +10,4 @@ Then, follow the instructions in `demo.ipynb` to see a test run of the models we
 If you wish to train your own VitSigNet, use the `train_siam.py` script and make sure to make adjustments to the dataloader and/or filepaths as needed.
 
 
-Credits to the authors of this [repo](https://github.com/jaehyunnn/ViTPose_pytorch.git) for their clean and efficient implementation of the the VitPose model, without which our work here would've been miles harder. If you have any suggestions on how we can improve our work, please feel to reach out on juvanjos [at] andrew.cmu.edu or nthumbav [at] andrew.cmu.edu !!
+Credits to the authors of this [repo](https://github.com/jaehyunnn/ViTPose_pytorch.git) for their clean and efficient implementation of the the ViTPose model. If you have any suggestions on how we can improve our work, please feel to reach out on juvanjos [at] andrew.cmu.edu or nthumbav [at] andrew.cmu.edu !!
